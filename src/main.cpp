@@ -31,23 +31,45 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// ===================== 时间常量 =====================
+const long long TICKS_PER_DAY = 24000; // 0x5DC0
+
 // ===================== Time State =====================
-static long long g_currentTime = 0;
+struct TimeState {
+    bool funcFound = false;
+    long long absoluteTime = 0;
+    int day = 0;
+};
+static TimeState g_timeState;
 static std::mutex g_timeMutex;
-static bool g_funcFound = false;
 
 // ===================== Hook Function Pointers =====================
 static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 static void (*orig_Input1)(void*, void*, void*) = nullptr;
 static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
-typedef long long (*TimeFunc)();
-static TimeFunc orig_getTime = nullptr;
+
+// 时间函数指针
+typedef long long (*GetTimeFunc)(void*);
+typedef int (*GetDayFunc)(void*);
+static GetTimeFunc orig_getTime = nullptr;
+static GetDayFunc orig_getDay = nullptr;
+static void* g_level = nullptr;
 
 // ===================== Time Hook =====================
-long long hook_getTime() {
-    long long time = orig_getTime();
+static long long hook_getTime(void* thisPtr) {
+    if (!orig_getTime) return 0;
+    
+    long long time = orig_getTime(thisPtr);
+    g_level = thisPtr;
+    
     std::lock_guard<std::mutex> lock(g_timeMutex);
-    g_currentTime = time;
+    g_timeState.absoluteTime = time;
+    
+    // 如果有 getDay 函数，也获取天数
+    if (orig_getDay && g_level) {
+        g_timeState.day = orig_getDay(g_level);
+    }
+    
     return time;
 }
 
@@ -159,34 +181,54 @@ static void SetupStyle() {
     s.GrabMinSize = (float)(int)(12.0f * roundScale);
 }
 
-// ===================== UI Interface: Time HUD =====================
+// ===================== UI Interface: Time HUD (强制显示) =====================
 static void DrawTimeHUD() {
     if (g_UIFont) ImGui::PushFont(g_UIFont);
 
+    TimeState state;
+    {
+        std::lock_guard<std::mutex> lock(g_timeMutex);
+        state = g_timeState;
+    }
+
+    // 强制显示在左上角
     ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Always);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(220, 0), ImVec2(300, 120));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(320, 180));
 
     ImGui::Begin("Game Time", nullptr,
         ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoFocusOnAppearing |
-        ImGuiWindowFlags_NoTitleBar); // 强制显示，去掉标题栏更简洁
+        ImGuiWindowFlags_NoTitleBar);
 
+    // 标题
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.4f, 0.85f, 1.0f));
     ImGui::Text("Game Time");
     ImGui::PopStyleColor();
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 8));
 
-    std::lock_guard<std::mutex> lock(g_timeMutex);
-    if (g_funcFound) {
-        ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "Ticks: %lld", g_currentTime);
+    if (state.funcFound) {
+        // 总刻数
+        ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "Ticks: %lld", state.absoluteTime);
         
-        int days = g_currentTime / 24000;
-        int hours = (g_currentTime % 24000) / 1000;
-        int minutes = ((g_currentTime % 24000) % 1000) * 60 / 1000;
+        // 优先使用直接获取的天数，如果没有则计算
+        int displayDay = (state.day > 0) ? state.day : (state.absoluteTime / TICKS_PER_DAY + 1);
         
-        ImGui::Text("Day %d, %02d:%02d", days + 1, hours, minutes);
+        int timeOfDay = state.absoluteTime % TICKS_PER_DAY;
+        int hours = timeOfDay / 1000;
+        int minutes = (timeOfDay % 1000) * 60 / 1000;
+        
+        ImGui::Text("Day: %d", displayDay);
+        ImGui::Text("Time: %02d:%02d", hours, minutes);
+        
+        // 昼夜判断 (MC 时间: 6:00-18:00 为白天)
+        ImGui::Dummy(ImVec2(0, 4));
+        if (hours >= 6 && hours < 18) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "☀ Daytime");
+        } else {
+            ImGui::TextColored(ImVec4(0.25f, 0.35f, 0.8f, 1.0f), "🌙 Nighttime");
+        }
     } else {
         ImGui::TextColored(ImVec4(0.55f, 0.48f, 0.62f, 1.0f), "Loading...");
     }
@@ -342,7 +384,7 @@ static void HookInput() {
     if (s2) GlossHook(s2, (void*)hook_Input2, (void**)&orig_Input2);
 }
 
-// ===================== Find and Hook Time Function =====================
+// ===================== Find and Hook Time Functions (通过 typeinfo 找 Level vtable) =====================
 static bool findAndHookTime() {
     void* mcLib = dlopen("libminecraftpe.so", RTLD_NOLOAD);
     if (!mcLib) {
@@ -352,20 +394,158 @@ static bool findAndHookTime() {
         LOGE("Failed to open libminecraftpe.so");
         return false;
     }
-
-    // 直接用符号找（你可以换成特征码/虚表）
-    orig_getTime = (TimeFunc)dlsym(mcLib, "_ZN20ScriptModuleMinecraft11ScriptWorld16getAbsoluteTimeEv");
     
-    if (orig_getTime) {
-        LOGI("Found time function at: %p", (void*)orig_getTime);
-        // 这里需要 Hook 它，你可以用 GlossHook 或者虚表替换
-        // 暂时先标记找到，你可以根据你版本的实际情况选择 Hook 方式
-        g_funcFound = true;
-        return true;
-    } else {
-        LOGE("Failed to find time function");
+    uintptr_t libBase = 0;
+    
+    // 1. 找 libminecraftpe.so 基址
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find("libminecraftpe.so") != std::string::npos && line.find("r-xp") != std::string::npos) {
+            uintptr_t start, end;
+            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
+                if (libBase == 0) libBase = start;
+            }
+        }
+    }
+    
+    if (libBase == 0) {
+        LOGE("Failed to find libminecraftpe.so base address");
         return false;
     }
+    
+    LOGI("libminecraftpe.so base: 0x%lx", libBase);
+    
+    // ============================================================
+    // 注意：这里需要让 AI 帮你确认 Level 的 typeinfo 字符串
+    // 通常是 "5Level"
+    // ============================================================
+    const char* typeinfoName = "5Level"; // 这里需要换成你版本的正确字符串！
+    size_t nameLen = strlen(typeinfoName);
+    
+    uintptr_t typeinfoNameAddr = 0;
+    
+    // 2. 找 typeinfo 名字符串
+    std::ifstream maps2("/proc/self/maps");
+    while (std::getline(maps2, line)) {
+        if (line.find("libminecraftpe.so") == std::string::npos) continue;
+        if (line.find("r--p") == std::string::npos && line.find("r-xp") == std::string::npos) continue;
+        
+        uintptr_t start, end;
+        if (sscanf(line.c_str(), "%lx-%lx", &start, &end) != 2) continue;
+        
+        for (uintptr_t addr = start; addr < end - nameLen; addr++) {
+            if (memcmp((void*)addr, typeinfoName, nameLen) == 0) {
+                typeinfoNameAddr = addr;
+                LOGI("Found typeinfo name at 0x%lx", typeinfoNameAddr);
+                break;
+            }
+        }
+        if (typeinfoNameAddr != 0) break;
+    }
+    
+    if (typeinfoNameAddr == 0) {
+        LOGE("Failed to find Level typeinfo name");
+        return false;
+    }
+    
+    uintptr_t typeinfoAddr = 0;
+    
+    // 3. 找 typeinfo 结构
+    std::ifstream maps3("/proc/self/maps");
+    while (std::getline(maps3, line)) {
+        if (line.find("libminecraftpe.so") == std::string::npos) continue;
+        if (line.find("r--p") == std::string::npos) continue;
+        
+        uintptr_t start, end;
+        if (sscanf(line.c_str(), "%lx-%lx", &start, &end) != 2) continue;
+        
+        for (uintptr_t addr = start; addr < end - sizeof(void*); addr += sizeof(void*)) {
+            uintptr_t* ptr = (uintptr_t*)addr;
+            if (*ptr == typeinfoNameAddr) {
+                typeinfoAddr = addr - sizeof(void*);
+                LOGI("Found typeinfo at 0x%lx", typeinfoAddr);
+                break;
+            }
+        }
+        if (typeinfoAddr != 0) break;
+    }
+    
+    if (typeinfoAddr == 0) {
+        LOGE("Failed to find Level typeinfo");
+        return false;
+    }
+    
+    uintptr_t vtableAddr = 0;
+    
+    // 4. 找虚表
+    std::ifstream maps4("/proc/self/maps");
+    while (std::getline(maps4, line)) {
+        if (line.find("libminecraftpe.so") == std::string::npos) continue;
+        if (line.find("r--p") == std::string::npos) continue;
+        
+        uintptr_t start, end;
+        if (sscanf(line.c_str(), "%lx-%lx", &start, &end) != 2) continue;
+        
+        for (uintptr_t addr = start; addr < end - sizeof(void*); addr += sizeof(void*)) {
+            uintptr_t* ptr = (uintptr_t*)addr;
+            if (*ptr == typeinfoAddr) {
+                vtableAddr = addr + sizeof(void*);
+                LOGI("Found vtable at 0x%lx", vtableAddr);
+                break;
+            }
+        }
+        if (vtableAddr != 0) break;
+    }
+    
+    if (vtableAddr == 0) {
+        LOGE("Failed to find Level vtable");
+        return false;
+    }
+    
+    // ============================================================
+    // 注意：这里的索引需要让 AI 帮你找
+    // 线索：
+    // 1. "Returns the current time stamp of the level" -> getTime 索引
+    // 2. "Returns the day of the current level." -> getDay 索引
+    // ============================================================
+    int getTimeIndex = 70; // 这里需要换成你版本的真实索引！
+    int getDayIndex = 71;  // 这里需要换成你版本的真实索引！
+    
+    // 5. Hook getTime
+    uint64_t* getTimeSlot = (uint64_t*)(vtableAddr + getTimeIndex * sizeof(void*));
+    orig_getTime = (GetTimeFunc)(*getTimeSlot);
+    LOGI("Original Level::getTime at: 0x%lx", (uintptr_t)orig_getTime);
+    
+    // 6. Hook getDay (如果找到索引)
+    if (getDayIndex > 0) {
+        uint64_t* getDaySlot = (uint64_t*)(vtableAddr + getDayIndex * sizeof(void*));
+        orig_getDay = (GetDayFunc)(*getDaySlot);
+        LOGI("Original Level::getDay at: 0x%lx", (uintptr_t)orig_getDay);
+    }
+    
+    // 7. 替换虚表
+    uintptr_t pageStart = (uintptr_t)getTimeSlot & ~(4095UL);
+    if (mprotect((void*)pageStart, 4096, PROT_READ | PROT_WRITE) != 0) {
+        LOGE("Failed to make vtable writable");
+        return false;
+    }
+    
+    *getTimeSlot = (uint64_t)hook_getTime;
+    
+    // 如果有 getDay，也替换它 (可选)
+    // if (orig_getDay && getDayIndex > 0) {
+    //     uint64_t* getDaySlot = (uint64_t*)(vtableAddr + getDayIndex * sizeof(void*));
+    //     *getDaySlot = (uint64_t)hook_getDay;
+    // }
+    
+    mprotect((void*)pageStart, 4096, PROT_READ);
+    
+    std::lock_guard<std::mutex> lock(g_timeMutex);
+    g_timeState.funcFound = true;
+    
+    LOGI("Successfully hooked Level::getTime");
+    return true;
 }
 
 // ===================== Main Thread =====================
