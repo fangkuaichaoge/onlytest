@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(ZoomMod LANGUAGES C CXX)
+project(TimeMod LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,10 +65,10 @@ set(SOURCES
 )
 
 # 生成最终的so库
-add_library(ZoomMod SHARED ${SOURCES})
+add_library(TimeMod SHARED ${SOURCES})
 
 # 链接所有依赖库
-target_link_libraries(ZoomMod
+target_link_libraries(TimeMod
     preloader
     fmt::fmt
     log
@@ -87,14 +87,14 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/output)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_BINARY_DIR}/output)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL ${CMAKE_BINARY_DIR}/output)
 
-set_target_properties(ZoomMod PROPERTIES
+set_target_properties(TimeMod PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
-    LIBRARY_OUTPUT_NAME ZoomMod
+    LIBRARY_OUTPUT_NAME TimeMod
 )
 
 # 构建完成后自动复制到 output 目录（保险措施）
-add_custom_command(TARGET ZoomMod POST_BUILD
+add_custom_command(TARGET TimeMod POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/output
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ZoomMod> ${CMAKE_BINARY_DIR}/output/
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:TimeMod> ${CMAKE_BINARY_DIR}/output/
     COMMENT "Copying library to output directory"
 )
