@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <iomanip>
+#include <unordered_map>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -28,9 +29,9 @@
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
-#define LOG_TAG "RayTraceViewer"
+#define LOG_TAG "RayTraceMatrix"
 
-// ===================== 极简日志 =====================
+// ===================== 工具与日志 =====================
 static std::mutex g_logMutex;
 static uintptr_t g_libBase = 0;
 
@@ -44,49 +45,52 @@ static void Log(const std::string& lvl, const std::string& msg) {
 #define LOGI_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("INFO", b); } while(0)
 #define LOGE_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("ERROR", b); } while(0)
 
-// ===================== 全局瞄准数据 =====================
+// ===================== 全局数据与状态 =====================
 struct AimData {
-    // 方块数据
     bool hasBlock = false;
-    int blockX = 0, blockY = 0, blockZ = 0;
-    
-    // 实体数据
+    int bx = 0, by = 0, bz = 0;
     bool hasEntity = false;
-    uint64_t entityRuntimeId = 0;
-    float entityDistance = 0.0f;
-    
+    uint64_t eid = 0;
     std::mutex mutex;
 };
-static AimData g_aimData;
-static bool g_hooksReady = false;
+static AimData g_data;
 
-// ===================== 函数指针定义 =====================
+// 记录哪些Hook被触发过
+static std::unordered_map<std::string, bool> g_hookStatus;
+static std::mutex g_statusMutex;
+static bool g_allHooksInstalled = false;
+
+// 通用原函数指针存储
 typedef void (*GenericFunc)();
-static GenericFunc g_orig_AimAssistTick = nullptr;
+static std::unordered_map<std::string, GenericFunc> g_origFuncs;
 
-// ===================== 核心Hook：瞄准辅助系统Tick =====================
-// Hook CameraAimAssistFetchValidEntityTargetSystem::tick (0x2691abe)
-// 这个函数每帧都会跑，并且已经算好了目标
-extern "C" void hook_AimAssistTick() {
-    // 1. 先调用原函数，让游戏算好目标
-    if (g_orig_AimAssistTick) {
-        g_orig_AimAssistTick();
-    }
-
-    // 2. 这里我们可以读取游戏算好的目标数据
-    // 注意：实际读取偏移需要根据反汇编调整，这里先标记有调用
-    static int callCount = 0;
-    if (callCount++ % 120 == 0) {
-        std::lock_guard<std::mutex> lock(g_aimData.mutex);
-        // 模拟数据更新，实际需根据内存结构填写
-        g_aimData.hasBlock = true; 
-        g_aimData.blockX = 100 + (callCount % 10); 
-        g_aimData.blockY = 64;
-        g_aimData.blockZ = 200;
-    }
+// ===================== 通用Hook回调模板 =====================
+// 这个宏定义生成一个通用的回调，记录触发并调用原函数
+#define DEF_UNIVERSAL_HOOK(name) \
+static void hook_##name() { \
+    { \
+        std::lock_guard<std::mutex> lock(g_statusMutex); \
+        if (!g_hookStatus[name]) { \
+            g_hookStatus[name] = true; \
+            LOGI_FMT("TRIGGERED: %s", #name); \
+        } \
+    } \
+    auto it = g_origFuncs.find(#name); \
+    if (it != g_origFuncs.end() && it->second) { \
+        it->second(); \
+    } \
 }
 
-// ===================== ImGui UI 渲染 =====================
+// 生成所有Hook回调
+DEF_UNIVERSAL_HOOK(getBlockFromViewDirection);
+DEF_UNIVERSAL_HOOK(getBlockFromViewVector);
+DEF_UNIVERSAL_HOOK(getEntitiesFromViewDirection);
+DEF_UNIVERSAL_HOOK(getEntitiesFromViewVector);
+DEF_UNIVERSAL_HOOK(AimAssistTick);
+DEF_UNIVERSAL_HOOK(sendContinuousPickHitResult);
+DEF_UNIVERSAL_HOOK(sendChangedHitResult);
+
+// ===================== ImGui UI =====================
 static bool g_imguiInit = false;
 static int g_screenW = 0, g_screenH = 0;
 static EGLContext g_eglCtx = EGL_NO_CONTEXT;
@@ -96,65 +100,69 @@ static ImFont* g_uiFont = nullptr;
 static void DrawUI() {
     if (g_uiFont) ImGui::PushFont(g_uiFont);
 
-    // 主窗口：瞄准信息
+    // 主窗口
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
-    ImGui::Begin("Aim Viewer", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("Ray Trace Matrix", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
     
-    ImGui::Text("MC Ray Trace Viewer");
+    ImGui::Text("MC Ray Trace Matrix");
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 6));
 
+    // 1. 瞄准数据
     {
-        std::lock_guard<std::mutex> lock(g_aimData.mutex);
+        std::lock_guard<std::mutex> lock(g_data.mutex);
+        ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Block:");
+        ImGui::SameLine();
+        if (g_data.hasBlock) ImGui::TextColored(ImVec4(0,1,0,1), "YES (%d, %d, %d)", g_data.bx, g_data.by, g_data.bz);
+        else ImGui::Text("NO");
 
-        // 显示方块信息
-        ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Looking At Block:");
-        if (g_aimData.hasBlock) {
-            ImGui::Text("  Pos: %d, %d, %d", g_aimData.blockX, g_aimData.blockY, g_aimData.blockZ);
-        } else {
-            ImGui::Text("  None");
-        }
-
-        ImGui::Dummy(ImVec2(0, 8));
-        ImGui::Separator();
-        ImGui::Dummy(ImVec2(0, 8));
-
-        // 显示实体信息
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "Looking At Entity:");
-        if (g_aimData.hasEntity) {
-            ImGui::Text("  ID: %llu", (unsigned long long)g_aimData.entityRuntimeId);
-            ImGui::Text("  Dist: %.1f", g_aimData.entityDistance);
-        } else {
-            ImGui::Text("  None");
-        }
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "Entity:");
+        ImGui::SameLine();
+        if (g_data.hasEntity) ImGui::TextColored(ImVec4(1,0.5f,0,1), "YES (ID: %llu)", (unsigned long long)g_data.eid);
+        else ImGui::Text("NO");
     }
 
-    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::Dummy(ImVec2(0, 8));
     ImGui::Separator();
-    ImGui::Text("Status: %s", g_hooksReady ? "Active" : "Loading...");
+    ImGui::Dummy(ImVec2(0, 6));
+
+    // 2. Hook状态矩阵
+    ImGui::Text("Hook Status Matrix:");
+    ImGui::Dummy(ImVec2(0, 4));
+    
+    {
+        std::lock_guard<std::mutex> lock(g_statusMutex);
+        for (auto& pair : g_hookStatus) {
+            if (pair.second) {
+                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "  [OK] %s", pair.first.c_str());
+            } else {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "  [..] %s", pair.first.c_str());
+            }
+        }
+    }
 
     ImGui::End();
 
     if (g_uiFont) ImGui::PopFont();
 }
 
-struct GLState { GLint prog, tex, arrBuf, elemBuf, vao, fbo, vp[4]; };
+struct GLState { GLint p, t, a, e, v, f, vp[4]; };
 static void SaveGL(GLState& s) {
-    glGetIntegerv(GL_CURRENT_PROGRAM, &s.prog);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.arrBuf);
-    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.elemBuf);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &s.p);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.t);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.a);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.e);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.v);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.f);
     glGetIntegerv(GL_VIEWPORT, s.vp);
 }
 static void RestoreGL(const GLState& s) {
-    glUseProgram(s.prog);
-    glBindTexture(GL_TEXTURE_2D, s.tex);
-    glBindBuffer(GL_ARRAY_BUFFER, s.arrBuf);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.elemBuf);
-    glBindVertexArray(s.vao);
-    glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
+    glUseProgram(s.p);
+    glBindTexture(GL_TEXTURE_2D, s.t);
+    glBindBuffer(GL_ARRAY_BUFFER, s.a);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.e);
+    glBindVertexArray(s.v);
+    glBindFramebuffer(GL_FRAMEBUFFER, s.f);
     glViewport(s.vp[0], s.vp[1], s.vp[2], s.vp[3]);
 }
 
@@ -227,11 +235,28 @@ static uintptr_t GetLibBase(const char* libName) {
     return base;
 }
 
+// ===================== 批量安装Hook辅助函数 =====================
+static bool InstallHook(const std::string& name, uintptr_t offset, void* hookFunc) {
+    uintptr_t addr = g_libBase + offset;
+    LOGI_FMT("Hooking %s @ 0x%lx...", name.c_str(), addr);
+    
+    GenericFunc orig = nullptr;
+    if (GlossHook((void*)addr, hookFunc, (void**)&orig)) {
+        g_origFuncs[name] = orig;
+        g_hookStatus[name] = false; // 初始化为未触发
+        LOGI_FMT("OK: %s", name.c_str());
+        return true;
+    } else {
+        LOGE_FMT("FAIL: %s", name.c_str());
+        return false;
+    }
+}
+
 // ===================== 主初始化 =====================
 static void* MainThread(void*) {
     sleep(5);
     LOGI("=====================================");
-    LOGI("Ray Trace Viewer Initializing...");
+    LOGI("Ray Trace Matrix Initializing...");
     GlossInit(true);
 
     // 基础Hook
@@ -250,23 +275,25 @@ static void* MainThread(void*) {
     LOGI_FMT("Lib Base: 0x%lx", g_libBase);
 
     // ==========================================
-    // 安装关键Hook (基于你的深度报告)
+    // 全量Hook矩阵安装 (基于你的深度报告)
     // ==========================================
-    int hookedCount = 0;
+    int successCount = 0;
 
-    // 1. Hook 瞄准辅助系统 Tick (0x2691abe)
-    uintptr_t aimAssistAddr = g_libBase + 0x2691abe;
-    LOGI_FMT("Hooking AimAssistTick @ 0x%lx...", aimAssistAddr);
-    if (GlossHook((void*)aimAssistAddr, (void*)hook_AimAssistTick, (void**)&g_orig_AimAssistTick)) {
-        LOGI("OK: AimAssistTick hooked");
-        hookedCount++;
-    }
+    // 第一组：射线检测函数
+    successCount += InstallHook("getBlockFromViewDirection", 0x2260088, (void*)hook_getBlockFromViewDirection);
+    successCount += InstallHook("getBlockFromViewVector", 0x22fe054, (void*)hook_getBlockFromViewVector);
+    successCount += InstallHook("getEntitiesFromViewDir", 0x203e1b4, (void*)hook_getEntitiesFromViewDirection);
+    successCount += InstallHook("getEntitiesFromViewVec", 0x22bba85, (void*)hook_getEntitiesFromViewVector);
 
-    // 预留位置：Hook sendContinuousPickHitResult (0x2c5a8b3)
-    // 这个是更好的选择，因为它直接包含 HitResult
-    
-    g_hooksReady = (hookedCount > 0);
-    LOGI_FMT("Setup complete. %d hooks installed.", hookedCount);
+    // 第二组：瞄准辅助系统
+    successCount += InstallHook("AimAssistTick", 0x2691abe, (void*)hook_AimAssistTick);
+
+    // 第三组：HitResult 系统 (最推荐)
+    successCount += InstallHook("sendContPickHit", 0x2c5a8b3, (void*)hook_sendContinuousPickHitResult);
+    successCount += InstallHook("sendChangedHit", 0x2c5a5a3, (void*)hook_sendChangedHitResult);
+
+    g_allHooksInstalled = true;
+    LOGI_FMT("Setup complete. %d/7 hooks installed.", successCount);
     LOGI("=====================================");
     return nullptr;
 }
