@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <iomanip>
+#include <unordered_map>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -31,12 +32,15 @@
 #define LOG_TAG "TimeMod"
 #define LOG_FILE "/storage/emulated/0/TimeMod_Debug.log"
 
-// ===================== 全局控制 =====================
+// ===================== 全局工具 =====================
 static std::mutex g_logMutex;
-static std::atomic<bool> g_isRunning(false);
-static std::thread* g_workerThread = nullptr;
+static int g_frameCounter = 0;
+static uintptr_t g_libBase = 0;
 
-// ===================== 日志 =====================
+// 记录哪些Hook被触发过
+static std::unordered_map<std::string, bool> g_hookTriggered;
+static std::mutex g_hookMutex;
+
 static void Log(const std::string& lvl, const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%s] %s", lvl.c_str(), msg.c_str());
@@ -52,116 +56,115 @@ static void Log(const std::string& lvl, const std::string& msg) {
 #define LOGI_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("INFO", b); } while(0)
 #define LOGE(x) do { char b[512]; snprintf(b, 512, x); Log("ERROR", b); } while(0)
 
+// 通用触发记录函数
+static void MarkTriggered(const std::string& name) {
+    std::lock_guard<std::mutex> lock(g_hookMutex);
+    if (!g_hookTriggered[name]) {
+        g_hookTriggered[name] = true;
+        LOGI_FMT("!!! TRIGGERED: %s", name.c_str());
+    }
+}
+
 // ===================== 数据状态 =====================
 struct TimeData {
-    long long absoluteTime = 0;
-    int timeOfDay = 0;
+    long long ticks = 0;
     int day = 0;
     bool valid = false;
 };
 static TimeData g_data;
 static std::mutex g_dataMutex;
 
-// ===================== 函数指针 =====================
-typedef long long (*Func_GetTimeOfDay)(void*);
-typedef long long (*Func_GetAbsoluteTime)(void*);
+// ===================== 核心函数指针 (用于主动调用) =====================
+typedef long long (*Func_GetAbsTime)(void*);
+typedef long long (*Func_GetTod)(void*);
+typedef void (*Func_SetAbsTime)(void*, int);
 
-static Func_GetTimeOfDay g_orig_GetTimeOfDay = nullptr;
-static Func_GetAbsoluteTime g_orig_GetAbsoluteTime = nullptr;
-static void* g_scriptWorldPtr = nullptr;
+static Func_GetAbsTime g_orig_GetAbsTime = nullptr;
+static Func_GetTod g_orig_GetTod = nullptr;
+static void* g_worldPtr = nullptr;
 static std::mutex g_ptrMutex;
 
-// ===================== 后台工作线程 (核心：持续执行) =====================
-static void WorkerLoop() {
-    LOGI("========== Worker Thread STARTED ==========");
-    int counter = 0;
-    
-    while (g_isRunning) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 20次/秒
+// ===================== 通用占位函数类型 (用于 void 返回值的监控) =====================
+typedef void (*GenericFunc)(void);
+static std::unordered_map<std::string, GenericFunc> g_origFuncs;
 
-        void* ptr = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_ptrMutex);
-            ptr = g_scriptWorldPtr;
-        }
+// ===================== 1. ScriptWorld 时间函数 Hooks (主动获取+监控) =====================
 
-        if (ptr != nullptr) {
-            // 有对象指针，直接调用原函数！
-            long long absTime = 0;
-            int todTime = 0;
-
-            if (g_orig_GetAbsoluteTime) {
-                absTime = g_orig_GetAbsoluteTime(ptr);
-            }
-            if (g_orig_GetTimeOfDay) {
-                todTime = (int)g_orig_GetTimeOfDay(ptr);
-            }
-
-            // 更新数据
-            {
-                std::lock_guard<std::mutex> lock2(g_dataMutex);
-                if (g_orig_GetAbsoluteTime) {
-                    g_data.absoluteTime = absTime;
-                    g_data.day = (int)(absTime / 24000 + 1);
-                }
-                if (g_orig_GetTimeOfDay) {
-                    g_data.timeOfDay = todTime;
-                    if (!g_orig_GetAbsoluteTime) {
-                        g_data.day = g_data.timeOfDay / 24000 + 1;
-                    }
-                }
-                g_data.valid = true;
-            }
-            
-            // 每2秒打印一次日志证明还活着
-            if (counter++ % 40 == 0) {
-                 LOGI_FMT("Worker running: Abs=%lld, Day=%d", g_data.absoluteTime, g_data.day);
-            }
-        } else {
-            // 还没抓到指针，每2秒打印一次等待信息
-            if (counter++ % 40 == 0) {
-                LOGI("Worker waiting for thisPtr... (Enter the game!)");
-            }
-        }
-    }
-    LOGI("Worker Thread stopped.");
-}
-
-// ===================== Hook 回调 (只负责抓 thisPtr) =====================
-static long long hook_GetTimeOfDay(void* thisPtr) {
-    bool isNew = false;
+// Hook: getAbsoluteTime
+static long long hook_GetAbsTime(void* thisPtr) {
+    MarkTriggered("ScriptWorld::getAbsoluteTime");
     {
         std::lock_guard<std::mutex> lock(g_ptrMutex);
-        if (g_scriptWorldPtr == nullptr) {
-            g_scriptWorldPtr = thisPtr;
-            isNew = true;
+        if (g_worldPtr == nullptr) {
+            g_worldPtr = thisPtr;
+            LOGI_FMT("CAPTURED thisPtr: %p", thisPtr);
         }
     }
-
-    if (isNew) {
-        LOGI_FMT("!!! CAPTURED thisPtr via getTimeOfDay: %p", thisPtr);
-    }
-
-    if (g_orig_GetTimeOfDay) return g_orig_GetTimeOfDay(thisPtr);
+    if (g_orig_GetAbsTime) return g_orig_GetAbsTime(thisPtr);
     return 0;
 }
 
-static long long hook_GetAbsoluteTime(void* thisPtr) {
-    bool isNew = false;
+// Hook: getTimeOfDay
+static long long hook_GetTod(void* thisPtr) {
+    MarkTriggered("ScriptWorld::getTimeOfDay");
     {
         std::lock_guard<std::mutex> lock(g_ptrMutex);
-        if (g_scriptWorldPtr == nullptr) {
-            g_scriptWorldPtr = thisPtr;
-            isNew = true;
+        if (g_worldPtr == nullptr) {
+            g_worldPtr = thisPtr;
+            LOGI_FMT("CAPTURED thisPtr: %p", thisPtr);
         }
     }
+    if (g_orig_GetTod) return g_orig_GetTod(thisPtr);
+    return 0;
+}
 
-    if (isNew) {
-        LOGI_FMT("!!! CAPTURED thisPtr via getAbsoluteTime: %p", thisPtr);
+// ===================== 2. 通用监控 Hook 模板 (仅用于观察) =====================
+// 这些宏定义生成简单的监控函数，不修改逻辑，只打日志
+
+#define DEFINE_MONITOR_HOOK(name) \
+static void hook_##name() { \
+    MarkTriggered(#name); \
+    auto it = g_origFuncs.find(#name); \
+    if (it != g_origFuncs.end() && it->second) { \
+        ((void(*)())(it->second))(); \
+    } \
+}
+
+// 定义所有监控点
+DEFINE_MONITOR_HOOK(TimeCommand_QueryGametime);
+DEFINE_MONITOR_HOOK(TimeCommand_QueryDaytime);
+DEFINE_MONITOR_HOOK(TimeCommand_Set);
+DEFINE_MONITOR_HOOK(DaylightCycle_Rule);
+DEFINE_MONITOR_HOOK(DoDaylightCycle_Switch);
+DEFINE_MONITOR_HOOK(DayCycleStopTime_Flag);
+
+// ===================== 核心逻辑：在渲染循环中主动更新 =====================
+static void UpdateTimeInRender() {
+    void* ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ptrMutex);
+        ptr = g_worldPtr;
     }
 
-    if (g_orig_GetAbsoluteTime) return g_orig_GetAbsoluteTime(thisPtr);
-    return 0;
+    if (ptr != nullptr) {
+        long long time = 0;
+        bool success = false;
+
+        if (g_orig_GetAbsTime) {
+            time = g_orig_GetAbsTime(ptr);
+            success = true;
+        } else if (g_orig_GetTod) {
+            time = g_orig_GetTod(ptr);
+            success = true;
+        }
+
+        if (success) {
+            std::lock_guard<std::mutex> lock2(g_dataMutex);
+            g_data.ticks = time;
+            g_data.day = (int)(time / 24000 + 1);
+            g_data.valid = true;
+        }
+    }
 }
 
 // ===================== ImGui & 渲染 =====================
@@ -185,18 +188,25 @@ static void DrawUI() {
         std::lock_guard<std::mutex> lock(g_dataMutex);
         if (g_data.valid) {
             ImGui::Text("Day: %d", g_data.day);
-            int tod = g_data.timeOfDay != 0 ? g_data.timeOfDay : (g_data.absoluteTime % 24000);
+            int tod = g_data.ticks % 24000;
             int h = tod / 1000;
             int m = (tod % 1000) * 60 / 1000;
             ImGui::Text("Time: %02d:%02d", h, m);
-            ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "Ticks: %lld", g_data.absoluteTime);
+            ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "Ticks: %lld", g_data.ticks);
         } else {
             ImGui::TextColored(ImVec4(0.55f, 0.48f, 0.62f, 1.0f), "Running...");
-            ImGui::Dummy(ImVec2(0, 4));
-            if (g_scriptWorldPtr) {
-                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Status: Syncing");
-            } else {
-                ImGui::Text("Status: Waiting");
+        }
+    }
+    
+    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::Separator();
+    ImGui::Text("Hook Status:");
+    
+    {
+        std::lock_guard<std::mutex> lock(g_hookMutex);
+        for (auto& pair : g_hookTriggered) {
+            if (pair.second) {
+                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "  [OK] %s", pair.first.c_str());
             }
         }
     }
@@ -246,7 +256,7 @@ static void SetupImGui() {
     g_init = true;
 }
 
-// ===================== EGL Hook =====================
+// ===================== EGL Hook (主循环) =====================
 static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface) = nullptr;
 static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     if (!orig_swap) return orig_swap(d, s);
@@ -264,6 +274,9 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
 
     g_w = w; g_h = h;
     SetupImGui();
+
+    // 每帧主动更新时间
+    UpdateTimeInRender();
 
     if (g_init) {
         GLState gls; SaveGL(gls);
@@ -305,13 +318,17 @@ static uintptr_t GetLibBase(const char* libName) {
     return base;
 }
 
-// ===================== 主初始化逻辑 =====================
+// ===================== 主初始化 =====================
 static void* MainThread(void*) {
     sleep(3);
-    LOGI("========== Initializing TimeMod ==========");
+    LOGI("========== TimeMod Mass Hook Init ==========");
     GlossInit(true);
 
-    // 1. Hook EGL & Input
+    // 清空旧日志
+    std::ofstream f_clear(LOG_FILE, std::ios::trunc);
+    if (f_clear.is_open()) f_clear.close();
+
+    // 1. 基础 Hook
     GHandle egl = GlossOpen("libEGL.so");
     void* swap = (void*)GlossSymbol(egl, "eglSwapBuffers", nullptr);
     if (swap) GlossHook(swap, (void*)hook_swap, (void**)&orig_swap);
@@ -322,38 +339,69 @@ static void* MainThread(void*) {
     if (s2) GlossHook(s2, (void*)hook_in2, (void**)&orig_in2);
 
     // 2. 获取基址
-    uintptr_t base = GetLibBase("libminecraftpe.so");
-    if (base == 0) { LOGE("Base not found"); return nullptr; }
-    LOGI_FMT("Lib Base: 0x%lx", base);
+    g_libBase = GetLibBase("libminecraftpe.so");
+    if (g_libBase == 0) { LOGE("Base not found"); return nullptr; }
+    LOGI_FMT("Lib Base: 0x%lx", g_libBase);
 
-    // 3. 安装 Hooks
-    LOGI("Installing Hooks...");
+    // ==========================================
+    // 3. 批量安装所有 Hooks (来自你的文档)
+    // ==========================================
+    LOGI("Installing all hooks...");
+
+    // --- 第一组：核心时间获取 (保存原函数指针以便主动调用) ---
+    uintptr_t addr;
     
-    // 目标1: getTimeOfDay (0x2ad4b90)
-    uintptr_t addr1 = base + 0x2ad4b90;
-    if (GlossHook((void*)addr1, (void*)hook_GetTimeOfDay, (void**)&g_orig_GetTimeOfDay)) {
-        LOGI_FMT("Hooked 1/2: getTimeOfDay @ 0x%lx", addr1);
+    // 1. getAbsoluteTime (0x2ad505c)
+    addr = g_libBase + 0x2ad505c;
+    if (GlossHook((void*)addr, (void*)hook_GetAbsTime, (void**)&g_orig_GetAbsTime)) {
+        LOGI_FMT("Hooked: getAbsoluteTime @ 0x%lx", addr);
     }
 
-    // 目标2: getAbsoluteTime (0x2ad505c)
-    uintptr_t addr2 = base + 0x2ad505c;
-    if (GlossHook((void*)addr2, (void*)hook_GetAbsoluteTime, (void**)&g_orig_GetAbsoluteTime)) {
-        LOGI_FMT("Hooked 2/2: getAbsoluteTime @ 0x%lx", addr2);
+    // 2. getTimeOfDay (0x2ad4b90)
+    addr = g_libBase + 0x2ad4b90;
+    if (GlossHook((void*)addr, (void*)hook_GetTod, (void**)&g_orig_GetTod)) {
+        LOGI_FMT("Hooked: getTimeOfDay @ 0x%lx", addr);
     }
 
-    // 4. 启动后台工作线程 (关键！)
-    LOGI("Starting Worker Thread...");
-    g_isRunning = true;
-    g_workerThread = new std::thread(WorkerLoop);
+    // --- 第二组：其他观察点 (仅监控) ---
+    // 这里使用宏来简化，把地址和名字对应起来
+    
+    struct MonitorTarget {
+        std::string name;
+        uintptr_t offset;
+        void* hookFunc;
+    };
 
-    LOGI("========== ALL READY ==========");
+    std::vector<MonitorTarget> monitors = {
+        // 命令相关
+        { "TimeCommand_QueryGametime", 0xe663614, (void*)hook_TimeCommand_QueryGametime },
+        { "TimeCommand_QueryDaytime", 0xe66347c, (void*)hook_TimeCommand_QueryDaytime },
+        { "TimeCommand_Set", 0xe6641bc, (void*)hook_TimeCommand_Set },
+        
+        // 日夜循环相关
+        { "DaylightCycle_Rule", 0x9c9c80c, (void*)hook_DaylightCycle_Rule },
+        { "DoDaylightCycle_Switch", 0x10555e20, (void*)hook_DoDaylightCycle_Switch },
+        { "DayCycleStopTime_Flag", 0x10549d94, (void*)hook_DayCycleStopTime_Flag },
+    };
+
+    for (auto& t : monitors) {
+        uintptr_t absAddr = g_libBase + t.offset;
+        // 我们需要一个地方存原函数指针，这里用 map
+        GenericFunc orig = nullptr;
+        if (GlossHook((void*)absAddr, t.hookFunc, (void**)&orig)) {
+            g_origFuncs[t.name] = orig;
+            LOGI_FMT("Monitored: %s @ 0x%lx", t.name.c_str(), absAddr);
+        } else {
+            LOGE_FMT("Failed: %s", t.name.c_str());
+        }
+    }
+
+    LOGI("========== ALL HOOKS INSTALLED ==========");
     return nullptr;
 }
 
 __attribute__((constructor))
 void init() {
-    std::ofstream f(LOG_FILE, std::ios::trunc);
-    if (f.is_open()) { f << "Module loaded." << std::endl; f.close(); }
     pthread_t t;
     pthread_create(&t, nullptr, MainThread, nullptr);
 }
