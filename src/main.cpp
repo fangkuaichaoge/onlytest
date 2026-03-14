@@ -19,6 +19,8 @@
 #include <sys/mman.h>
 #include <fstream>
 #include <algorithm>
+#include <sstream>
+#include <iomanip>
 
 // ===================== Project Header Files =====================
 #include "pl/Hook.h"
@@ -28,8 +30,39 @@
 #include "ImGui/backends/imgui_impl_android.h"
 
 #define LOG_TAG "TimeMod"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOG_FILE_PATH "/storage/emulated/0/TimeMod_Debug.log"
+
+// ===================== 全局日志锁 =====================
+static std::mutex g_logMutex;
+
+// ===================== 日志函数 (同时输出到 Logcat 和文件) =====================
+static void LogDebug(const std::string& level, const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    
+    // 1. 输出到 Logcat
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%s] %s", level.c_str(), msg.c_str());
+    
+    // 2. 输出到文件
+    std::ofstream logFile(LOG_FILE_PATH, std::ios::app);
+    if (logFile.is_open()) {
+        auto now = std::chrono::system_clock::now();
+        auto time_t_now = std::chrono::system_clock::to_time_t(now);
+        logFile << "[" << std::put_time(std::localtime(&time_t_now), "%H:%M:%S") << "] [" << level << "] " << msg << std::endl;
+        logFile.close();
+    }
+}
+
+#define LOGI_F(...) { \
+    char buf[1024]; \
+    snprintf(buf, sizeof(buf), __VA_ARGS__); \
+    LogDebug("INFO", buf); \
+}
+
+#define LOGE_F(...) { \
+    char buf[1024]; \
+    snprintf(buf, sizeof(buf), __VA_ARGS__); \
+    LogDebug("ERROR", buf); \
+}
 
 // ===================== 时间常量 =====================
 const long long TICKS_PER_DAY = 24000; // 0x5DC0
@@ -52,9 +85,16 @@ static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**
 typedef long long (*ScriptGetTimeOfDayFunc)(void*);
 static ScriptGetTimeOfDayFunc orig_scriptGetTimeOfDay = nullptr;
 static void* g_scriptWorld = nullptr;
+static bool g_hookCalled = false; // 标记 Hook 函数是否被调用过
 
-// ===================== Time Hook (通用，不管是符号还是地址来的) =====================
+// ===================== Time Hook =====================
 static long long hook_scriptGetTimeOfDay(void* thisPtr) {
+    // 只要进了这个函数，就说明 Hook 成功了！
+    if (!g_hookCalled) {
+        LOGI_F("SUCCESS! hook_scriptGetTimeOfDay has been called! thisPtr: %p", thisPtr);
+        g_hookCalled = true;
+    }
+
     if (!orig_scriptGetTimeOfDay) return 0;
     
     long long time = orig_scriptGetTimeOfDay(thisPtr);
@@ -186,7 +226,7 @@ static void DrawTimeHUD() {
     }
 
     ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Always);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(320, 180));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(320, 200));
 
     ImGui::Begin("Game Time", nullptr,
         ImGuiWindowFlags_AlwaysAutoResize |
@@ -219,6 +259,10 @@ static void DrawTimeHUD() {
         }
     } else {
         ImGui::TextColored(ImVec4(0.55f, 0.48f, 0.62f, 1.0f), "Loading...");
+        // 显示调试状态
+        if (g_hookCalled) {
+             ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Hook Active!");
+        }
     }
 
     ImGui::End();
@@ -361,37 +405,64 @@ static int32_t hook_Input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4,
 }
 
 static void HookInput() {
+    LOGI_F("Attempting to Hook Input...");
     void* s1 = (void*)GlossSymbol(GlossOpen("libinput.so"),
         "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
-    if (s1) GlossHook(s1, (void*)hook_Input1, (void**)&orig_Input1);
+    if (s1) {
+        GlossHook(s1, (void*)hook_Input1, (void**)&orig_Input1);
+        LOGI_F("Input1 Hooked.");
+    } else {
+        LOGE_F("Input1 symbol not found.");
+    }
 
     void* s2 = (void*)GlossSymbol(GlossOpen("libinput.so"),
         "_ZN7android13InputConsumer7consumeEPNS_10InputEventEblPjPSA_", nullptr);
-    if (s2) GlossHook(s2, (void*)hook_Input2, (void**)&orig_Input2);
+    if (s2) {
+        GlossHook(s2, (void*)hook_Input2, (void**)&orig_Input2);
+        LOGI_F("Input2 Hooked.");
+    } else {
+        LOGE_F("Input2 symbol not found.");
+    }
 }
 
 // ===================== 核心逻辑：双路尝试 Hook =====================
 static bool findAndHookTime() {
+    LOGI_F("Entering findAndHookTime...");
+    
+    // 清空旧日志
+    std::ofstream logFile(LOG_FILE_PATH, std::ios::trunc);
+    if (logFile.is_open()) logFile.close();
+
     void* mcLib = dlopen("libminecraftpe.so", RTLD_NOLOAD);
     if (!mcLib) {
+        LOGI_F("libminecraftpe.so not loaded yet, trying dlopen(RTLD_LAZY)...");
         mcLib = dlopen("libminecraftpe.so", RTLD_LAZY);
     }
     if (!mcLib) {
-        LOGE("Failed to open libminecraftpe.so");
+        LOGE_F("Failed to open libminecraftpe.so");
         return false;
     }
+    LOGI_F("libminecraftpe.so handle obtained: %p", mcLib);
     
     uintptr_t libBase = 0;
-    // 获取基址（给地址模式用）
+    // 获取基址
     std::ifstream maps("/proc/self/maps");
     std::string line;
     while (std::getline(maps, line)) {
         if (line.find("libminecraftpe.so") != std::string::npos && line.find("r-xp") != std::string::npos) {
             uintptr_t start, end;
             if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                if (libBase == 0) libBase = start;
+                if (libBase == 0) {
+                    libBase = start;
+                    LOGI_F("Found libminecraftpe.so base: 0x%lx", libBase);
+                }
             }
         }
+    }
+
+    if (libBase == 0) {
+        LOGE_F("Failed to find library base address!");
+        return false;
     }
 
     bool hooked = false;
@@ -401,49 +472,58 @@ static bool findAndHookTime() {
     // ==========================================
     // 第一步：尝试 符号 Hook
     // ==========================================
-    LOGI("Attempt 1: Hook by Symbol...");
+    LOGI_F("--- Attempt 1: Hook by Symbol ---");
     void* funcAddr = (void*)GlossSymbol(GlossOpen("libminecraftpe.so"), targetSymbol, nullptr);
-    if (!funcAddr) funcAddr = dlsym(mcLib, targetSymbol);
+    LOGI_F("GlossSymbol result: %p", funcAddr);
+    
+    if (!funcAddr) {
+        funcAddr = dlsym(mcLib, targetSymbol);
+        LOGI_F("dlsym result: %p", funcAddr);
+    }
 
     if (funcAddr) {
-        LOGI("Found function via symbol: 0x%lx", (uintptr_t)funcAddr);
+        LOGI_F("Found function via symbol: 0x%lx", (uintptr_t)funcAddr);
         orig_scriptGetTimeOfDay = (ScriptGetTimeOfDayFunc)funcAddr;
+        
+        LOGI_F("Calling GlossHook for Symbol...");
         if (GlossHook(funcAddr, (void*)hook_scriptGetTimeOfDay, (void**)&orig_scriptGetTimeOfDay)) {
-            LOGI("Success: Hooked via Symbol!");
+            LOGI_F("SUCCESS: Hooked via Symbol!");
             hooked = true;
         } else {
-            LOGE("Failed: Hook by Symbol failed.");
+            LOGE_F("FAILED: GlossHook returned false for Symbol.");
         }
     } else {
-        LOGE("Failed: Symbol not found.");
+        LOGE_F("FAILED: Symbol not found in library.");
     }
 
     // ==========================================
     // 第二步：如果符号失败，尝试 反射地址 Hook
     // ==========================================
-    if (!hooked && libBase != 0) {
-        LOGI("Attempt 2: Hook by Reflection Address...");
+    if (!hooked) {
+        LOGI_F("--- Attempt 2: Hook by Reflection Address ---");
         funcAddr = (void*)(libBase + reflectionOffset);
-        LOGI("Calculated function address: 0x%lx (Base: 0x%lx + Offset: 0x%lx)", 
-             (uintptr_t)funcAddr, libBase, reflectionOffset);
+        LOGI_F("Calculated address: Base(0x%lx) + Offset(0x%lx) = 0x%lx", libBase, reflectionOffset, (uintptr_t)funcAddr);
 
         orig_scriptGetTimeOfDay = (ScriptGetTimeOfDayFunc)funcAddr;
+        
+        LOGI_F("Calling GlossHook for Address...");
         if (GlossHook(funcAddr, (void*)hook_scriptGetTimeOfDay, (void**)&orig_scriptGetTimeOfDay)) {
-            LOGI("Success: Hooked via Reflection Address!");
+            LOGI_F("SUCCESS: Hooked via Reflection Address!");
             hooked = true;
         } else {
-            LOGE("Failed: Hook by Reflection Address failed.");
+            LOGE_F("FAILED: GlossHook returned false for Address.");
         }
-    } else if (!hooked && libBase == 0) {
-        LOGE("Abort: Could not find lib base for reflection hook.");
     }
 
     // ==========================================
     // 最终状态更新
     // ==========================================
     if (hooked) {
+        LOGI_F("Hook installation successful. Waiting for game to call function...");
         std::lock_guard<std::mutex> lock(g_timeMutex);
         g_timeState.funcFound = true;
+    } else {
+        LOGE_F("FATAL: All hook attempts failed.");
     }
 
     return hooked;
@@ -451,25 +531,45 @@ static bool findAndHookTime() {
 
 // ===================== Main Thread =====================
 static void* MainThread(void*) {
+    LOGI_F("MainThread started. Sleeping 3 seconds...");
     sleep(3);
+    LOGI_F("Initializing Gloss...");
     GlossInit(true);
     
+    LOGI_F("Hooking EGL...");
     GHandle egl = GlossOpen("libEGL.so");
-    if (!egl) return nullptr;
+    if (!egl) {
+        LOGE_F("Failed to open libEGL.so");
+        return nullptr;
+    }
     void* swap = (void*)GlossSymbol(egl, "eglSwapBuffers", nullptr);
-    if (swap) GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    if (swap) {
+        GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+        LOGI_F("eglSwapBuffers hooked.");
+    } else {
+        LOGE_F("eglSwapBuffers symbol not found.");
+    }
     
     HookInput();
     
     if (!findAndHookTime()) {
-        LOGE("FATAL: Both hook methods failed.");
+        LOGE_F("findAndHookTime returned false.");
     }
     
+    LOGI_F("MainThread setup complete.");
     return nullptr;
 }
 
 __attribute__((constructor))
 void init() {
+    // 立即写一条日志证明模块加载了
+    std::ofstream logFile(LOG_FILE_PATH, std::ios::trunc);
+    if (logFile.is_open()) {
+        logFile << "TimeMod initialized. Constructor called." << std::endl;
+        logFile.close();
+    }
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Constructor called.");
+    
     pthread_t t;
     pthread_create(&t, nullptr, MainThread, nullptr);
 }
