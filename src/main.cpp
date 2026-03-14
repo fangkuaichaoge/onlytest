@@ -20,6 +20,7 @@
 #include <fstream>
 #include <algorithm>
 #include <atomic>
+#include <iomanip>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -30,26 +31,9 @@
 #define LOG_TAG "TimeMod"
 #define LOG_FILE "/storage/emulated/0/TimeMod_Debug.log"
 
-// ===================== Globals =====================
+// ===================== 全局工具与日志 =====================
 static std::mutex g_logMutex;
-static std::atomic<bool> g_gotData(false);
-static std::thread* g_workerThread = nullptr;
 
-// 核心数据
-typedef long long (*TimeFunc)(void*);
-static TimeFunc g_originalTimeFunc = nullptr; // 真实的函数地址
-static void* g_worldPtr = nullptr;             // 真实的对象指针
-
-// 显示数据
-struct TimeData {
-    long long ticks = 0;
-    int day = 0;
-    bool valid = false;
-};
-static TimeData g_displayData;
-static std::mutex g_dataMutex;
-
-// ===================== Logging =====================
 static void Log(const std::string& lvl, const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%s] %s", lvl.c_str(), msg.c_str());
@@ -64,51 +48,84 @@ static void Log(const std::string& lvl, const std::string& msg) {
 #define LOGI(x) do { char b[512]; snprintf(b, 512, x); Log("INFO", b); } while(0)
 #define LOGI_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("INFO", b); } while(0)
 #define LOGE(x) do { char b[512]; snprintf(b, 512, x); Log("ERROR", b); } while(0)
+#define LOGE_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("ERROR", b); } while(0)
 
-// ===================== Worker Thread (主动调用) =====================
-static void WorkerLoop() {
-    LOGI("Worker Thread started. Actively polling time...");
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 20 FPS 更新率
+// ===================== 数据状态 =====================
+struct TimeData {
+    long long absoluteTime = 0;
+    int timeOfDay = 0;
+    int day = 0;
+    bool hasAbsTime = false;
+    bool hasDayTime = false;
+};
+static TimeData g_data;
+static std::mutex g_dataMutex;
 
-        if (g_originalTimeFunc && g_worldPtr) {
-            // 直接调用游戏函数！
-            long long t = g_originalTimeFunc(g_worldPtr);
-            
-            std::lock_guard<std::mutex> lock(g_dataMutex);
-            g_displayData.ticks = t;
-            g_displayData.day = t / 24000 + 1;
-            g_displayData.valid = true;
-            
-            if (!g_gotData) {
-                g_gotData = true;
-                LOGI_FMT("SUCCESS: Data flowing! First tick: %lld", t);
-            }
+// ===================== 函数指针类型定义 =====================
+typedef long long (*Func_GetTimeOfDay)(void*);
+typedef long long (*Func_GetAbsoluteTime)(void*);
+
+// 原函数指针
+static Func_GetTimeOfDay g_orig_GetTimeOfDay = nullptr;
+static Func_GetAbsoluteTime g_orig_GetAbsoluteTime = nullptr;
+
+// 对象指针 (thisPtr)
+static void* g_scriptWorldPtr = nullptr;
+static std::mutex g_ptrMutex;
+
+// ===================== Hook 回调 1: getTimeOfDay =====================
+static long long hook_GetTimeOfDay(void* thisPtr) {
+    {
+        std::lock_guard<std::mutex> lock(g_ptrMutex);
+        if (g_scriptWorldPtr == nullptr) {
+            g_scriptWorldPtr = thisPtr;
+            LOGI_FMT("SUCCESS: hook_GetTimeOfDay triggered! thisPtr: %p", thisPtr);
         }
     }
-}
 
-// ===================== Hook Callback (被动捕获) =====================
-static long long hook_getTime(void* thisPtr) {
-    // 只要进了这里，我们就成功了一半！
-    if (g_worldPtr == nullptr) {
-        LOGI_FMT("Hook triggered! Captured thisPtr: %p", thisPtr);
-        g_worldPtr = thisPtr;
-        
-        // 启动工作线程
-        if (g_workerThread == nullptr) {
-            g_workerThread = new std::thread(WorkerLoop);
+    long long ret = 0;
+    if (g_orig_GetTimeOfDay) {
+        ret = g_orig_GetTimeOfDay(thisPtr);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock2(g_dataMutex);
+        g_data.timeOfDay = (int)ret;
+        g_data.hasDayTime = true;
+        if (!g_data.hasAbsTime) {
+            g_data.day = g_data.timeOfDay / 24000 + 1;
         }
     }
 
-    // 调用原函数
-    if (g_originalTimeFunc) {
-        return g_originalTimeFunc(thisPtr);
-    }
-    return 0;
+    return ret;
 }
 
-// ===================== ImGui & Render =====================
+// ===================== Hook 回调 2: getAbsoluteTime =====================
+static long long hook_GetAbsoluteTime(void* thisPtr) {
+    {
+        std::lock_guard<std::mutex> lock(g_ptrMutex);
+        if (g_scriptWorldPtr == nullptr) {
+            g_scriptWorldPtr = thisPtr;
+            LOGI_FMT("SUCCESS: hook_GetAbsoluteTime triggered! thisPtr: %p", thisPtr);
+        }
+    }
+
+    long long ret = 0;
+    if (g_orig_GetAbsoluteTime) {
+        ret = g_orig_GetAbsoluteTime(thisPtr);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock2(g_dataMutex);
+        g_data.absoluteTime = ret;
+        g_data.hasAbsTime = true;
+        g_data.day = (int)(ret / 24000 + 1);
+    }
+
+    return ret;
+}
+
+// ===================== ImGui & 渲染 =====================
 static bool g_init = false;
 static int g_w = 0, g_h = 0;
 static EGLContext g_ctx = EGL_NO_CONTEXT;
@@ -125,20 +142,34 @@ static void DrawUI() {
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 4));
 
+    bool hasData = false;
     {
         std::lock_guard<std::mutex> lock(g_dataMutex);
-        if (g_displayData.valid) {
-            ImGui::Text("Day: %d", g_displayData.day);
-            int tod = g_displayData.ticks % 24000;
+        if (g_data.hasAbsTime || g_data.hasDayTime) {
+            hasData = true;
+            
+            ImGui::Text("Day: %d", g_data.day);
+            
+            int tod = g_data.hasDayTime ? g_data.timeOfDay : (g_data.absoluteTime % 24000);
             int h = tod / 1000;
             int m = (tod % 1000) * 60 / 1000;
             ImGui::Text("Time: %02d:%02d", h, m);
-            ImGui::Text("Ticks: %lld", g_displayData.ticks);
-        } else {
-            ImGui::Text("Waiting for data...");
-            if (g_originalTimeFunc) ImGui::Text("Func: OK");
-            if (g_worldPtr) ImGui::Text("Ptr: OK");
+            
+            if (g_data.hasAbsTime) {
+                ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "Abs Ticks: %lld", g_data.absoluteTime);
+            }
+            if (g_data.hasDayTime) {
+                ImGui::Text("Day Ticks: %d", g_data.timeOfDay);
+            }
         }
+    }
+
+    if (!hasData) {
+        ImGui::TextColored(ImVec4(0.55f, 0.48f, 0.62f, 1.0f), "Hooking...");
+        ImGui::Dummy(ImVec2(0, 4));
+        if (g_orig_GetTimeOfDay) ImGui::Text("Func1: Ready");
+        if (g_orig_GetAbsoluteTime) ImGui::Text("Func2: Ready");
+        if (g_scriptWorldPtr) ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Ptr: Captured");
     }
 
     ImGui::End();
@@ -179,7 +210,6 @@ static void SetupImGui() {
     ImGui_ImplAndroid_Init(nullptr);
     ImGui_ImplOpenGL3_Init("#version 300 es");
     
-    // Simple style
     ImGui::GetStyle().WindowRounding = 8.0f;
     ImGui::GetStyle().Colors[ImGuiCol_WindowBg] = ImVec4(0.94f, 0.90f, 0.98f, 0.96f);
     ImGui::GetStyle().Colors[ImGuiCol_Text] = ImVec4(0.28f, 0.22f, 0.38f, 1.0f);
@@ -187,7 +217,7 @@ static void SetupImGui() {
     g_init = true;
 }
 
-// ===================== EGL Hook (渲染循环) =====================
+// ===================== EGL Hook =====================
 static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface) = nullptr;
 static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     if (!orig_swap) return orig_swap(d, s);
@@ -227,69 +257,90 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
 // ===================== Input Hooks =====================
 static void (*orig_in1)(void*, void*, void*) = nullptr;
 static int32_t (*orig_in2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
-
 static void hook_in1(void* thiz, void* a1, void* a2) { if(orig_in1) orig_in1(thiz,a1,a2); if(thiz&&g_init) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz); }
 static int32_t hook_in2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** e) { int r=orig_in2?orig_in2(thiz,a1,a2,a3,a4,e):0; if(r==0&&e&&*e&&g_init) ImGui_ImplAndroid_HandleInputEvent(*e); return r; }
 
-// ===================== Main Init =====================
-static void* MainThread(void*) {
-    sleep(3);
-    LOGI("Initializing...");
-    GlossInit(true);
-
-    // Hook EGL
-    GHandle egl = GlossOpen("libEGL.so");
-    void* swap = (void*)GlossSymbol(egl, "eglSwapBuffers", nullptr);
-    if (swap) GlossHook(swap, (void*)hook_swap, (void**)&orig_swap);
-
-    // Hook Input
-    void* s1 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
-    if (s1) GlossHook(s1, (void*)hook_in1, (void**)&orig_in1);
-    void* s2 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_10InputEventEblPjPSA_", nullptr);
-    if (s2) GlossHook(s2, (void*)hook_in2, (void**)&orig_in2);
-
-    // ==========================================
-    // 核心逻辑：Hook 目标函数
-    // ==========================================
-    LOGI("Finding target function...");
-    
-    // 1. 找基址
-    void* mcLib = dlopen("libminecraftpe.so", RTLD_NOLOAD);
-    if (!mcLib) mcLib = dlopen("libminecraftpe.so", RTLD_LAZY);
-    if (!mcLib) { LOGE("libminecraftpe.so not found"); return nullptr; }
-
+// ===================== 辅助：获取基址 =====================
+static uintptr_t GetLibBase(const char* libName) {
     uintptr_t base = 0;
     std::ifstream maps("/proc/self/maps");
     std::string line;
     while (std::getline(maps, line)) {
-        if (line.find("libminecraftpe.so") != std::string::npos && line.find("r-xp") != std::string::npos) {
+        if (line.find(libName) != std::string::npos && line.find("r-xp") != std::string::npos) {
             uintptr_t s, e;
             if (sscanf(line.c_str(), "%lx-%lx", &s, &e) == 2) {
                 if (base == 0) base = s;
             }
         }
     }
-    if (base == 0) { LOGE("Base not found"); return nullptr; }
+    return base;
+}
 
-    // 2. 计算地址
-    const uintptr_t offset = 0x2ad4af1; // 你提供的最新地址
-    uintptr_t absAddr = base + offset;
-    LOGI_FMT("Base: 0x%lx | Offset: 0x%lx | Abs: 0x%lx", base, offset, absAddr);
+// ===================== 主初始化逻辑 =====================
+static void* MainThread(void*) {
+    sleep(3);
+    LOGI("========== Initializing TimeMod ==========");
+    GlossInit(true);
 
-    // 3. 保存原函数指针（以便我们自己主动调用）
-    g_originalTimeFunc = (TimeFunc)absAddr;
+    // 1. Hook EGL & Input
+    LOGI("Hooking EGL...");
+    GHandle egl = GlossOpen("libEGL.so");
+    void* swap = (void*)GlossSymbol(egl, "eglSwapBuffers", nullptr);
+    if (swap) GlossHook(swap, (void*)hook_swap, (void**)&orig_swap);
 
-    // 4. 安装 Hook（以便我们捕获 thisPtr）
-    LOGI("Installing hook...");
-    if (GlossHook((void*)absAddr, (void*)hook_getTime, (void**)&g_originalTimeFunc)) {
-        LOGI("Hook installed successfully!");
-    } else {
-        // 如果 GlossHook 失败，尝试只保存不 hook（虽然没 thisPtr 不行，但至少日志有记录）
-        LOGI("Hook install failed, but func ptr saved.");
-        g_originalTimeFunc = (TimeFunc)absAddr; 
+    LOGI("Hooking Input...");
+    void* s1 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
+    if (s1) GlossHook(s1, (void*)hook_in1, (void**)&orig_in1);
+    void* s2 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_10InputEventEblPjPSA_", nullptr);
+    if (s2) GlossHook(s2, (void*)hook_in2, (void**)&orig_in2);
+
+    // 2. 获取基址
+    LOGI("Calculating library base...");
+    uintptr_t base = GetLibBase("libminecraftpe.so");
+    if (base == 0) {
+        LOGE("Failed to find libminecraftpe.so base!");
+        return nullptr;
+    }
+    LOGI_FMT("Lib Base: 0x%lx", base);
+
+    // ==========================================
+    // 3. 批量安装 Hooks (根据你提供的文档)
+    // ==========================================
+    LOGI("========== Installing Target Hooks ==========");
+
+    // 定义偏移量表
+    struct HookTarget {
+        std::string name;
+        uintptr_t offset;
+        void* hookFunc;
+        void** origFuncPtr;
+    };
+
+    // 来自文档的偏移：
+    // getTimeOfDay: 反射函数地址 0x2ad4b90
+    // getAbsoluteTime: 反射函数地址 0x2ad505c
+    std::vector<HookTarget> targets = {
+        { "getTimeOfDay", 0x2ad4b90, (void*)hook_GetTimeOfDay, (void**)&g_orig_GetTimeOfDay },
+        { "getAbsoluteTime", 0x2ad505c, (void*)hook_GetAbsoluteTime, (void**)&g_orig_GetAbsoluteTime }
+    };
+
+    for (auto& target : targets) {
+        uintptr_t absAddr = base + target.offset;
+        LOGI_FMT("Processing: %s", target.name.c_str());
+        LOGI_FMT("  Offset: 0x%lx | Abs Addr: 0x%lx", target.offset, absAddr);
+
+        // 尝试 Hook
+        if (GlossHook((void*)absAddr, target.hookFunc, target.origFuncPtr)) {
+            LOGI_FMT("  SUCCESS: %s hooked!", target.name.c_str());
+        } else {
+            LOGE_FMT("  FAILED: Could not hook %s", target.name.c_str());
+            // 即使hook失败，也尝试保存原函数指针用于调试
+            *target.origFuncPtr = (void*)absAddr; 
+        }
     }
 
-    LOGI("Init complete. Enter the game!");
+    LOGI("========== Setup Complete ==========");
+    LOGI("Now enter the game and load a world.");
     return nullptr;
 }
 
@@ -297,7 +348,10 @@ __attribute__((constructor))
 void init() {
     // 清空旧日志
     std::ofstream f(LOG_FILE, std::ios::trunc);
-    if (f.is_open()) { f << "Module loaded." << std::endl; f.close(); }
+    if (f.is_open()) { 
+        f << "TimeMod loaded. Waiting for setup..." << std::endl; 
+        f.close(); 
+    }
     
     pthread_t t;
     pthread_create(&t, nullptr, MainThread, nullptr);
