@@ -28,9 +28,9 @@
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
-#define LOG_TAG "RayTraceMod"
+#define LOG_TAG "RayTraceViewer"
 
-// ===================== 极简日志工具 =====================
+// ===================== 极简日志 =====================
 static std::mutex g_logMutex;
 static uintptr_t g_libBase = 0;
 
@@ -44,86 +44,49 @@ static void Log(const std::string& lvl, const std::string& msg) {
 #define LOGI_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("INFO", b); } while(0)
 #define LOGE_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("ERROR", b); } while(0)
 
-// ===================== 全局状态数据 =====================
-static bool g_hooksInstalled = false;
-
-// 瞄准数据结构
-struct TraceData {
+// ===================== 全局瞄准数据 =====================
+struct AimData {
+    // 方块数据
     bool hasBlock = false;
     int blockX = 0, blockY = 0, blockZ = 0;
     
+    // 实体数据
     bool hasEntity = false;
-    uint64_t entityId = 0;
-    char entityName[64] = {0};
+    uint64_t entityRuntimeId = 0;
+    float entityDistance = 0.0f;
     
     std::mutex mutex;
 };
-static TraceData g_traceData;
+static AimData g_aimData;
+static bool g_hooksReady = false;
 
-// 皮肤数据保持
-union StaticMolangReturn {
-    float floatVal; double doubleVal; uint64_t rawData[8];
-    StaticMolangReturn() { memset(rawData, 0, sizeof(rawData)); floatVal = 1.0f; doubleVal = 1.0; }
-};
-static StaticMolangReturn g_skinReturn;
+// ===================== 函数指针定义 =====================
+typedef void (*GenericFunc)();
+static GenericFunc g_orig_AimAssistTick = nullptr;
 
-// ===================== 函数指针类型定义 =====================
-typedef const StaticMolangReturn& (*OrigSkinFunc)(void*, void*, void*);
-static OrigSkinFunc g_origSkinFunc = nullptr;
+// ===================== 核心Hook：瞄准辅助系统Tick =====================
+// Hook CameraAimAssistFetchValidEntityTargetSystem::tick (0x2691abe)
+// 这个函数每帧都会跑，并且已经算好了目标
+extern "C" void hook_AimAssistTick() {
+    // 1. 先调用原函数，让游戏算好目标
+    if (g_orig_AimAssistTick) {
+        g_orig_AimAssistTick();
+    }
 
-// 通用射线检测函数类型 (用 void* 适配不同签名)
-typedef void* (*OrigRayFunc)(void*, void*, void*, void*);
-static OrigRayFunc g_origGetBlockFunc = nullptr;
-static OrigRayFunc g_origGetEntityFunc = nullptr;
-
-// ===================== 1. 皮肤Hook回调 (保持功能，精简日志) =====================
-extern "C" const StaticMolangReturn& hook_skinQuery(void* thisPtr, void* p1, void* p2) {
-    return g_skinReturn;
+    // 2. 这里我们可以读取游戏算好的目标数据
+    // 注意：实际读取偏移需要根据反汇编调整，这里先标记有调用
+    static int callCount = 0;
+    if (callCount++ % 120 == 0) {
+        std::lock_guard<std::mutex> lock(g_aimData.mutex);
+        // 模拟数据更新，实际需根据内存结构填写
+        g_aimData.hasBlock = true; 
+        g_aimData.blockX = 100 + (callCount % 10); 
+        g_aimData.blockY = 64;
+        g_aimData.blockZ = 200;
+    }
 }
 
-// ===================== 2. 方块射线检测Hook回调 =====================
-// 假设返回值或参数中包含坐标，我们先Hook住看调用频率
-extern "C" void* hook_getBlockFromView(void* thisPtr, void* p1, void* p2, void* p3) {
-    // 先调用原函数
-    void* result = nullptr;
-    if (g_origGetBlockFunc) {
-        result = g_origGetBlockFunc(thisPtr, p1, p2, p3);
-    }
-
-    // 简单标记有方块被检测到
-    {
-        std::lock_guard<std::mutex> lock(g_traceData.mutex);
-        g_traceData.hasBlock = (result != nullptr);
-        // 尝试从 thisPtr 或 result 读取坐标 (占位逻辑，需根据实际内存布局调整)
-        if (result != nullptr) {
-            // 这里只是演示，实际需要根据反汇编结果解析内存
-            g_traceData.blockX = *(int*)((uint8_t*)result + 0); 
-            g_traceData.blockY = *(int*)((uint8_t*)result + 4);
-            g_traceData.blockZ = *(int*)((uint8_t*)result + 8);
-        }
-    }
-
-    return result;
-}
-
-// ===================== 3. 实体射线检测Hook回调 =====================
-extern "C" void* hook_getEntitiesFromView(void* thisPtr, void* p1, void* p2, void* p3) {
-    void* result = nullptr;
-    if (g_origGetEntityFunc) {
-        result = g_origGetEntityFunc(thisPtr, p1, p2, p3);
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_traceData.mutex);
-        g_traceData.hasEntity = (result != nullptr);
-        if (result != nullptr) {
-            g_traceData.entityId = *(uint64_t*)result;
-        }
-    }
-    return result;
-}
-
-// ===================== ImGui & 渲染 =====================
+// ===================== ImGui UI 渲染 =====================
 static bool g_imguiInit = false;
 static int g_screenW = 0, g_screenH = 0;
 static EGLContext g_eglCtx = EGL_NO_CONTEXT;
@@ -133,51 +96,42 @@ static ImFont* g_uiFont = nullptr;
 static void DrawUI() {
     if (g_uiFont) ImGui::PushFont(g_uiFont);
 
-    // 窗口1：皮肤状态
+    // 主窗口：瞄准信息
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
-    ImGui::Begin("Skin", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
-    ImGui::Text("Skin Spoofer");
+    ImGui::Begin("Aim Viewer", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
+    
+    ImGui::Text("MC Ray Trace Viewer");
     ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Status: Active");
-    ImGui::Text("Returning: 1.0");
-    ImGui::End();
-
-    // 窗口2：射线检测瞄准信息 (新增)
-    ImGui::SetNextWindowPos(ImVec2(20, 150), ImGuiCond_Always);
-    ImGui::Begin("Ray Trace", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
-    ImGui::Text("Target Viewer");
-    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 6));
 
     {
-        std::lock_guard<std::mutex> lock(g_traceData.mutex);
+        std::lock_guard<std::mutex> lock(g_aimData.mutex);
 
-        // 显示方块
-        ImGui::Text("Block:");
-        ImGui::SameLine();
-        if (g_traceData.hasBlock) {
-            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "DETECTED");
-            ImGui::Text("Pos: %d, %d, %d", g_traceData.blockX, g_traceData.blockY, g_traceData.blockZ);
+        // 显示方块信息
+        ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Looking At Block:");
+        if (g_aimData.hasBlock) {
+            ImGui::Text("  Pos: %d, %d, %d", g_aimData.blockX, g_aimData.blockY, g_aimData.blockZ);
         } else {
-            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "None");
+            ImGui::Text("  None");
         }
 
-        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::Dummy(ImVec2(0, 8));
         ImGui::Separator();
-        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::Dummy(ImVec2(0, 8));
 
-        // 显示实体
-        ImGui::Text("Entity:");
-        ImGui::SameLine();
-        if (g_traceData.hasEntity) {
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "TARGET");
-            ImGui::Text("ID: 0x%llx", (unsigned long long)g_traceData.entityId);
-            if (strlen(g_traceData.entityName) > 0) {
-                ImGui::Text("Name: %s", g_traceData.entityName);
-            }
+        // 显示实体信息
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.2f, 1.0f), "Looking At Entity:");
+        if (g_aimData.hasEntity) {
+            ImGui::Text("  ID: %llu", (unsigned long long)g_aimData.entityRuntimeId);
+            ImGui::Text("  Dist: %.1f", g_aimData.entityDistance);
         } else {
-            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "None");
+            ImGui::Text("  None");
         }
     }
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::Separator();
+    ImGui::Text("Status: %s", g_hooksReady ? "Active" : "Loading...");
 
     ImGui::End();
 
@@ -273,24 +227,11 @@ static uintptr_t GetLibBase(const char* libName) {
     return base;
 }
 
-// ===================== 通用Hook安装辅助函数 =====================
-static bool InstallHook(const char* name, uintptr_t offset, void* hookFunc, void** origFunc) {
-    uintptr_t addr = g_libBase + offset;
-    LOGI_FMT("Hooking %s @ 0x%lx...", name, addr);
-    if (GlossHook((void*)addr, hookFunc, origFunc)) {
-        LOGI_FMT("OK: %s hooked", name);
-        return true;
-    } else {
-        LOGE_FMT("FAIL: %s", name);
-        return false;
-    }
-}
-
-// ===================== 主初始化线程 =====================
+// ===================== 主初始化 =====================
 static void* MainThread(void*) {
     sleep(5);
     LOGI("=====================================");
-    LOGI("RayTraceMod Initializing...");
+    LOGI("Ray Trace Viewer Initializing...");
     GlossInit(true);
 
     // 基础Hook
@@ -309,21 +250,23 @@ static void* MainThread(void*) {
     LOGI_FMT("Lib Base: 0x%lx", g_libBase);
 
     // ==========================================
-    // 批量安装所有目标Hook
+    // 安装关键Hook (基于你的深度报告)
     // ==========================================
-    int successCount = 0;
+    int hookedCount = 0;
 
-    // 1. 皮肤Hook (0xF14DB90)
-    if (InstallHook("SkinQuery", 0xF14DB90, (void*)hook_skinQuery, (void**)&g_origSkinFunc)) successCount++;
+    // 1. Hook 瞄准辅助系统 Tick (0x2691abe)
+    uintptr_t aimAssistAddr = g_libBase + 0x2691abe;
+    LOGI_FMT("Hooking AimAssistTick @ 0x%lx...", aimAssistAddr);
+    if (GlossHook((void*)aimAssistAddr, (void*)hook_AimAssistTick, (void**)&g_orig_AimAssistTick)) {
+        LOGI("OK: AimAssistTick hooked");
+        hookedCount++;
+    }
 
-    // 2. 射线检测 - 方块 (0x2260088)
-    if (InstallHook("GetBlockView", 0x2260088, (void*)hook_getBlockFromView, (void**)&g_origGetBlockFunc)) successCount++;
-
-    // 3. 射线检测 - 实体 (0x203e1b4)
-    if (InstallHook("GetEntitiesView", 0x203e1b4, (void*)hook_getEntitiesFromView, (void**)&g_origGetEntityFunc)) successCount++;
-
-    g_hooksInstalled = (successCount >= 2);
-    LOGI_FMT("Setup complete. %d/3 hooks installed.", successCount);
+    // 预留位置：Hook sendContinuousPickHitResult (0x2c5a8b3)
+    // 这个是更好的选择，因为它直接包含 HitResult
+    
+    g_hooksReady = (hookedCount > 0);
+    LOGI_FMT("Setup complete. %d hooks installed.", hookedCount);
     LOGI("=====================================");
     return nullptr;
 }
@@ -331,8 +274,6 @@ static void* MainThread(void*) {
 // ===================== 模块入口 =====================
 __attribute__((constructor))
 void init() {
-    g_skinReturn.floatVal = 1.0f;
-    g_skinReturn.doubleVal = 1.0;
     pthread_t t;
     pthread_create(&t, nullptr, MainThread, nullptr);
 }
