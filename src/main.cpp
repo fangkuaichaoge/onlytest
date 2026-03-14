@@ -28,84 +28,99 @@
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
-#define LOG_TAG "SkinSpoofer"
-#define LOG_FILE "/storage/emulated/0/SkinSpoofer_Debug.log"
+#define LOG_TAG "RayTraceMod"
 
-// ===================== 全局工具 =====================
+// ===================== 极简日志工具 =====================
 static std::mutex g_logMutex;
 static uintptr_t g_libBase = 0;
-static bool g_fileLogEnabled = true;
 
 static void Log(const std::string& lvl, const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     if (lvl == "ERROR") __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "[%s] %s", lvl.c_str(), msg.c_str());
     else __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%s] %s", lvl.c_str(), msg.c_str());
+}
+#define LOGI(x) do { char b[512]; snprintf(b, 512, x); Log("INFO", b); } while(0)
+#define LOGE(x) do { char b[512]; snprintf(b, 512, x); Log("ERROR", b); } while(0)
+#define LOGI_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("INFO", b); } while(0)
+#define LOGE_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("ERROR", b); } while(0)
 
-    if (!g_fileLogEnabled) return;
-    try {
-        std::ofstream f(LOG_FILE, std::ios::app);
-        if (f.is_open()) {
-            auto now = std::chrono::system_clock::now();
-            auto t = std::chrono::system_clock::to_time_t(now);
-            f << "[" << std::put_time(std::localtime(&t), "%H:%M:%S") << "] [" << lvl << "] " << msg << std::endl;
-            f.close();
-        } else {
-            g_fileLogEnabled = false;
-            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "File log disabled (permission)");
-        }
-    } catch (...) {
-        g_fileLogEnabled = false;
-    }
+// ===================== 全局状态数据 =====================
+static bool g_hooksInstalled = false;
+
+// 瞄准数据结构
+struct TraceData {
+    bool hasBlock = false;
+    int blockX = 0, blockY = 0, blockZ = 0;
+    
+    bool hasEntity = false;
+    uint64_t entityId = 0;
+    char entityName[64] = {0};
+    
+    std::mutex mutex;
+};
+static TraceData g_traceData;
+
+// 皮肤数据保持
+union StaticMolangReturn {
+    float floatVal; double doubleVal; uint64_t rawData[8];
+    StaticMolangReturn() { memset(rawData, 0, sizeof(rawData)); floatVal = 1.0f; doubleVal = 1.0; }
+};
+static StaticMolangReturn g_skinReturn;
+
+// ===================== 函数指针类型定义 =====================
+typedef const StaticMolangReturn& (*OrigSkinFunc)(void*, void*, void*);
+static OrigSkinFunc g_origSkinFunc = nullptr;
+
+// 通用射线检测函数类型 (用 void* 适配不同签名)
+typedef void* (*OrigRayFunc)(void*, void*, void*, void*);
+static OrigRayFunc g_origGetBlockFunc = nullptr;
+static OrigRayFunc g_origGetEntityFunc = nullptr;
+
+// ===================== 1. 皮肤Hook回调 (保持功能，精简日志) =====================
+extern "C" const StaticMolangReturn& hook_skinQuery(void* thisPtr, void* p1, void* p2) {
+    return g_skinReturn;
 }
 
-#define LOGI(x) do { char b[1024]; snprintf(b, 1024, x); Log("INFO", b); } while(0)
-#define LOGE(x) do { char b[1024]; snprintf(b, 1024, x); Log("ERROR", b); } while(0)
-#define LOGI_FMT(...) do { char b[1024]; snprintf(b, 1024, __VA_ARGS__); Log("INFO", b); } while(0)
-#define LOGE_FMT(...) do { char b[1024]; snprintf(b, 1024, __VA_ARGS__); Log("ERROR", b); } while(0)
-
-// ===================== 状态变量 =====================
-static bool g_hookInstalled = false;
-static std::atomic<int> g_totalCallCount(0);
-static std::atomic<int> g_lastLogCallCount(0);
-
-// ===================== 安全的静态返回值容器 =====================
-union StaticMolangReturn {
-    float floatVal;
-    double doubleVal;
-    int32_t intVal;
-    uint64_t rawData[8];
-    StaticMolangReturn() {
-        memset(rawData, 0, sizeof(rawData));
-        floatVal = 1.0f;
-        doubleVal = 1.0;
-    }
-};
-static StaticMolangReturn g_staticReturn;
-
-// ===================== 修复：函数指针类型 (把引用改成指针) =====================
-typedef const StaticMolangReturn& (*OrigQueryFunc)(void*, void*, void*);
-static OrigQueryFunc g_origQueryFunc = nullptr;
-
-// ===================== 修复：Hook回调函数 (把引用改成指针) =====================
-extern "C" const StaticMolangReturn& hook_queryHandler(
-    void* thisPtr, 
-    void* renderParams, 
-    void* exprNodes
-) {
-    int currentCount = ++g_totalCallCount;
-
-    LOGI_FMT("=== Hook TRIGGERED ===");
-    LOGI_FMT("Call Count: %d", currentCount);
-    LOGI_FMT("thisPtr: %p", thisPtr);
-    LOGI_FMT("RenderParams: %p", renderParams);
-    LOGI_FMT("ExprNodes: %p", exprNodes);
-
-    if (currentCount - g_lastLogCallCount >= 60) {
-        g_lastLogCallCount = currentCount;
-        LOGI_FMT("Total calls: %d, returning 1.0", currentCount);
+// ===================== 2. 方块射线检测Hook回调 =====================
+// 假设返回值或参数中包含坐标，我们先Hook住看调用频率
+extern "C" void* hook_getBlockFromView(void* thisPtr, void* p1, void* p2, void* p3) {
+    // 先调用原函数
+    void* result = nullptr;
+    if (g_origGetBlockFunc) {
+        result = g_origGetBlockFunc(thisPtr, p1, p2, p3);
     }
 
-    return g_staticReturn;
+    // 简单标记有方块被检测到
+    {
+        std::lock_guard<std::mutex> lock(g_traceData.mutex);
+        g_traceData.hasBlock = (result != nullptr);
+        // 尝试从 thisPtr 或 result 读取坐标 (占位逻辑，需根据实际内存布局调整)
+        if (result != nullptr) {
+            // 这里只是演示，实际需要根据反汇编结果解析内存
+            g_traceData.blockX = *(int*)((uint8_t*)result + 0); 
+            g_traceData.blockY = *(int*)((uint8_t*)result + 4);
+            g_traceData.blockZ = *(int*)((uint8_t*)result + 8);
+        }
+    }
+
+    return result;
+}
+
+// ===================== 3. 实体射线检测Hook回调 =====================
+extern "C" void* hook_getEntitiesFromView(void* thisPtr, void* p1, void* p2, void* p3) {
+    void* result = nullptr;
+    if (g_origGetEntityFunc) {
+        result = g_origGetEntityFunc(thisPtr, p1, p2, p3);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_traceData.mutex);
+        g_traceData.hasEntity = (result != nullptr);
+        if (result != nullptr) {
+            g_traceData.entityId = *(uint64_t*)result;
+        }
+    }
+    return result;
 }
 
 // ===================== ImGui & 渲染 =====================
@@ -117,31 +132,55 @@ static ImFont* g_uiFont = nullptr;
 
 static void DrawUI() {
     if (g_uiFont) ImGui::PushFont(g_uiFont);
+
+    // 窗口1：皮肤状态
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
-    ImGui::Begin("Skin Spoofer", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
-    
+    ImGui::Begin("Skin", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::Text("Skin Spoofer");
     ImGui::Separator();
-    ImGui::Dummy(ImVec2(0, 4));
-    ImGui::Text("Target: query.is_persona_or_premium_skin");
-    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Status: Active");
+    ImGui::Text("Returning: 1.0");
+    ImGui::End();
 
-    if (g_hookInstalled) ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Hook Status: INSTALLED");
-    else ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "Hook Status: INSTALLING...");
+    // 窗口2：射线检测瞄准信息 (新增)
+    ImGui::SetNextWindowPos(ImVec2(20, 150), ImGuiCond_Always);
+    ImGui::Begin("Ray Trace", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Text("Target Viewer");
+    ImGui::Separator();
 
-    int callCount = g_totalCallCount;
-    if (callCount > 0) {
+    {
+        std::lock_guard<std::mutex> lock(g_traceData.mutex);
+
+        // 显示方块
+        ImGui::Text("Block:");
+        ImGui::SameLine();
+        if (g_traceData.hasBlock) {
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "DETECTED");
+            ImGui::Text("Pos: %d, %d, %d", g_traceData.blockX, g_traceData.blockY, g_traceData.blockZ);
+        } else {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "None");
+        }
+
+        ImGui::Dummy(ImVec2(0, 4));
         ImGui::Separator();
         ImGui::Dummy(ImVec2(0, 4));
-        ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "Spoof Status: ACTIVE");
-        ImGui::Text("Return Value: 1.0");
-        ImGui::Text("Total Intercepts: %d", callCount);
-    } else {
-        ImGui::TextColored(ImVec4(0.55f, 0.48f, 0.62f, 1.0f), "Waiting for query call...");
+
+        // 显示实体
+        ImGui::Text("Entity:");
+        ImGui::SameLine();
+        if (g_traceData.hasEntity) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "TARGET");
+            ImGui::Text("ID: 0x%llx", (unsigned long long)g_traceData.entityId);
+            if (strlen(g_traceData.entityName) > 0) {
+                ImGui::Text("Name: %s", g_traceData.entityName);
+            }
+        } else {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "None");
+        }
     }
 
-    if (!g_fileLogEnabled) ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Warn: File log disabled");
     ImGui::End();
+
     if (g_uiFont) ImGui::PopFont();
 }
 
@@ -167,7 +206,6 @@ static void RestoreGL(const GLState& s) {
 
 static void SetupImGui() {
     if (g_imguiInit || g_screenW <=0 || g_screenH <=0) return;
-    LOGI("Initializing ImGui...");
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
@@ -181,7 +219,6 @@ static void SetupImGui() {
     ImGui::GetStyle().Colors[ImGuiCol_WindowBg] = ImVec4(0.94f, 0.90f, 0.98f, 0.96f);
     ImGui::GetStyle().Colors[ImGuiCol_Text] = ImVec4(0.28f, 0.22f, 0.38f, 1.0f);
     g_imguiInit = true;
-    LOGI("ImGui initialized");
 }
 
 // ===================== EGL Hook =====================
@@ -222,7 +259,6 @@ static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4,
 
 // ===================== 辅助：获取基址 =====================
 static uintptr_t GetLibBase(const char* libName) {
-    LOGI_FMT("Searching base for: %s", libName);
     uintptr_t base = 0;
     std::ifstream maps("/proc/self/maps");
     std::string line;
@@ -230,59 +266,73 @@ static uintptr_t GetLibBase(const char* libName) {
         if (line.find(libName) != std::string::npos && line.find("r-xp") != std::string::npos) {
             uintptr_t start, end;
             if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                if (base == 0) { base = start; LOGI_FMT("Found base: 0x%lx", base); break; }
+                if (base == 0) base = start;
             }
         }
     }
-    if (base == 0) LOGE_FMT("Failed to find base for %s", libName);
     return base;
+}
+
+// ===================== 通用Hook安装辅助函数 =====================
+static bool InstallHook(const char* name, uintptr_t offset, void* hookFunc, void** origFunc) {
+    uintptr_t addr = g_libBase + offset;
+    LOGI_FMT("Hooking %s @ 0x%lx...", name, addr);
+    if (GlossHook((void*)addr, hookFunc, origFunc)) {
+        LOGI_FMT("OK: %s hooked", name);
+        return true;
+    } else {
+        LOGE_FMT("FAIL: %s", name);
+        return false;
+    }
 }
 
 // ===================== 主初始化线程 =====================
 static void* MainThread(void*) {
-    LOGI("MainThread started, waiting 6s...");
-    for (int i=1; i<=6; i++) { sleep(1); LOGI_FMT("Wait: %d/6", i); }
-    LOGI("Initializing...");
+    sleep(5);
+    LOGI("=====================================");
+    LOGI("RayTraceMod Initializing...");
     GlossInit(true);
 
-    if (g_fileLogEnabled) { std::ofstream f_clear(LOG_FILE, std::ios::trunc); if(f_clear.is_open()) f_clear.close(); }
-
+    // 基础Hook
     GHandle eglHandle = GlossOpen("libEGL.so");
     void* swapAddr = (void*)GlossSymbol(eglHandle, "eglSwapBuffers", nullptr);
-    if (swapAddr) { GlossHook(swapAddr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers); LOGI("EGL hooked"); }
-
+    if (swapAddr) GlossHook(swapAddr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    
     void* in1Addr = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
     if (in1Addr) GlossHook(in1Addr, (void*)hook_input1, (void**)&orig_input1);
     void* in2Addr = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_10InputEventEblPjPSA_", nullptr);
     if (in2Addr) GlossHook(in2Addr, (void*)hook_input2, (void**)&orig_input2);
-    LOGI("Input hooked");
 
+    // 获取基址
     g_libBase = GetLibBase("libminecraftpe.so");
-    if (g_libBase == 0) return nullptr;
+    if (g_libBase == 0) { LOGE("Base not found"); return nullptr; }
+    LOGI_FMT("Lib Base: 0x%lx", g_libBase);
 
-    const uintptr_t targetOffset = 0xF14DB90;
-    uintptr_t targetAbsAddr = g_libBase + targetOffset;
-    LOGI_FMT("Target: 0x%lx (Base+0x%lx)", targetAbsAddr, targetOffset);
-    LOGI("Installing hook...");
+    // ==========================================
+    // 批量安装所有目标Hook
+    // ==========================================
+    int successCount = 0;
 
-    if (GlossHook((void*)targetAbsAddr, (void*)hook_queryHandler, (void**)&g_origQueryFunc)) {
-        LOGI("========== SUCCESS: Hook Installed ==========");
-        g_hookInstalled = true;
-    } else {
-        LOGE("Hook install failed");
-    }
+    // 1. 皮肤Hook (0xF14DB90)
+    if (InstallHook("SkinQuery", 0xF14DB90, (void*)hook_skinQuery, (void**)&g_origSkinFunc)) successCount++;
 
-    LOGI("Setup complete");
+    // 2. 射线检测 - 方块 (0x2260088)
+    if (InstallHook("GetBlockView", 0x2260088, (void*)hook_getBlockFromView, (void**)&g_origGetBlockFunc)) successCount++;
+
+    // 3. 射线检测 - 实体 (0x203e1b4)
+    if (InstallHook("GetEntitiesView", 0x203e1b4, (void*)hook_getEntitiesFromView, (void**)&g_origGetEntityFunc)) successCount++;
+
+    g_hooksInstalled = (successCount >= 2);
+    LOGI_FMT("Setup complete. %d/3 hooks installed.", successCount);
+    LOGI("=====================================");
     return nullptr;
 }
 
 // ===================== 模块入口 =====================
 __attribute__((constructor))
 void init() {
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "=====================================");
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "SkinSpoofer LOADED");
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "=====================================");
-    g_staticReturn.floatVal = 1.0f;
-    g_staticReturn.doubleVal = 1.0;
-    pthread_t t; pthread_create(&t, nullptr, MainThread, nullptr);
+    g_skinReturn.floatVal = 1.0f;
+    g_skinReturn.doubleVal = 1.0;
+    pthread_t t;
+    pthread_create(&t, nullptr, MainThread, nullptr);
 }
