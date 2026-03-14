@@ -33,7 +33,6 @@
 
 // ===================== 全局工具 =====================
 static std::mutex g_logMutex;
-static int g_callCounter = 0;
 static uintptr_t g_libBase = 0;
 
 static void Log(const std::string& lvl, const std::string& msg) {
@@ -55,53 +54,42 @@ static void Log(const std::string& lvl, const std::string& msg) {
 
 // ===================== UI 状态 =====================
 static bool g_hookInstalled = false;
-static bool g_hookTriggered = false;
+static std::atomic<int> g_callCount(0);
 
-// ===================== 定义 Molang 返回值结构 (简化版) =====================
-// 注意：这是一个占位符结构，实际大小可能更大，但我们只关心如何设置 float 值
-// 假设 MolangScriptArg 是一个包含 float 或 double 的联合体/类
-struct MolangScriptArg {
-    // 强制设置为 1.0 的辅助函数
-    // 实际内存布局取决于游戏，但通常第一个字段就是 float/double
-    void setToOne() {
-        // 尝试将开头的 8 字节设为 double 1.0 或 4 字节设为 float 1.0
-        // 这里我们两种都试，确保生效
-        float* f_ptr = (float*)this;
-        *f_ptr = 1.0f;
-        
-        double* d_ptr = (double*)this;
-        *d_ptr = 1.0;
+// ===================== 关键：静态返回值容器 =====================
+// 我们不修改游戏的内存，而是返回我们自己这个静态变量的引用
+// 这个联合体模拟了一个可以存放 float/double 的结构
+union StaticReturnValue {
+    float f_val;
+    double d_val;
+    uint64_t padding[4]; // 足够大的空间防止越界
+
+    StaticReturnValue() {
+        f_val = 1.0f;
+        d_val = 1.0;
     }
 };
+static StaticReturnValue g_staticReturn; // 全局静态实例
 
-// 原函数指针类型
-// 签名: const MolangScriptArg& queryHandler(RenderParams&, const std::vector<ExpressionNode>&)
-// 我们用 void* 来简化，因为我们只关心修改返回值
-typedef const MolangScriptArg& (*OrigQueryFunc)(void*, void*, void*);
-static OrigQueryFunc g_origQueryFunc = nullptr;
+// ===================== 原函数指针类型 (简化) =====================
+// 我们不再需要正确定义它，因为我们不打算调用它
+typedef void* OrigFuncType;
+static OrigFuncType g_origFunc = nullptr;
 
-// ===================== Hook 回调函数 (核心逻辑) =====================
-static const MolangScriptArg& hook_queryHandler(void* thisPtr, void* renderParams, void* exprNodes) {
-    // 1. 先调用原函数获取返回值引用
-    const MolangScriptArg& originalResult = g_origQueryFunc(thisPtr, renderParams, exprNodes);
+// ===================== 安全的 Hook 回调 (核心修复) =====================
+// 注意：我们使用 "naked" 或简单的 C 链接方式，并且不调用原函数
+// 直接返回我们静态变量的地址
+extern "C" const StaticReturnValue& hook_queryHandler() {
+    // 增加计数
+    int count = ++g_callCount;
     
-    // 2. 记录日志 (防止刷屏，每60帧记一次)
-    static int counter = 0;
-    if (counter++ % 60 == 0) {
-        LOGI_FMT("Query triggered! Spoofing to 1.0 (Calls: %d)", counter);
-    }
-    
-    if (!g_hookTriggered) {
-        g_hookTriggered = true;
-        LOGI("!!! SUCCESS: Hook is active and modifying return value!");
+    // 每60帧打一次日志
+    if (count % 60 == 1) {
+        LOGI_FMT("Query intercepted! Returning 1.0 (Total calls: %d)", count);
     }
 
-    // 3. 强制修改返回值为 1.0
-    // 注意：因为返回的是 const 引用，我们需要去掉 const 限定符来修改
-    MolangScriptArg& mutableResult = const_cast<MolangScriptArg&>(originalResult);
-    mutableResult.setToOne();
-
-    return originalResult;
+    // 直接返回我们自己的静态变量，完全不碰游戏的数据
+    return g_staticReturn;
 }
 
 // ===================== ImGui & 渲染 =====================
@@ -121,7 +109,7 @@ static void DrawUI() {
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 4));
 
-    ImGui::Text("Target: query.is_persona_or_premium_skin");
+    ImGui::Text("Target: query.is_persona...");
     ImGui::Dummy(ImVec2(0, 4));
 
     if (g_hookInstalled) {
@@ -130,11 +118,12 @@ static void DrawUI() {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "Status: Installing...");
     }
 
-    if (g_hookTriggered) {
+    if (g_callCount > 0) {
         ImGui::Separator();
         ImGui::Dummy(ImVec2(0, 4));
         ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "Spoofing: ACTIVE");
         ImGui::Text("Returning: 1.0");
+        ImGui::Text("Intercepts: %d", (int)g_callCount);
     }
 
     ImGui::End();
@@ -243,15 +232,18 @@ static uintptr_t GetLibBase(const char* libName) {
 
 // ===================== 主初始化 =====================
 static void* MainThread(void*) {
-    sleep(3);
-    LOGI("========== SkinSpoofer Init ==========");
+    // 稍微多等一会，让游戏完全加载好再 Hook
+    LOGI("Waiting for game to fully load...");
+    sleep(5); 
+    
+    LOGI("========== SkinSpoofer Init (Safe Mode) ==========");
     GlossInit(true);
 
     // 清空旧日志
     std::ofstream f_clear(LOG_FILE, std::ios::trunc);
     if (f_clear.is_open()) f_clear.close();
 
-    // 1. 基础 Hook (EGL & Input)
+    // 1. 基础 Hook
     GHandle egl = GlossOpen("libEGL.so");
     void* swap = (void*)GlossSymbol(egl, "eglSwapBuffers", nullptr);
     if (swap) GlossHook(swap, (void*)hook_swap, (void**)&orig_swap);
@@ -266,22 +258,21 @@ static void* MainThread(void*) {
     if (g_libBase == 0) { LOGE("Base not found"); return nullptr; }
     LOGI_FMT("Lib Base: 0x%lx", g_libBase);
 
-    // ==========================================
-    // 3. 安装核心 Hook: query.is_persona_or_premium_skin
-    // ==========================================
-    LOGI("Installing Molang Query Hook...");
+    // 3. 安装核心 Hook
+    LOGI("Installing Molang Query Hook (Safe Mode)...");
     
-    // 来自你的文档: 注册函数 sub_F14DB90 (0xF14DB90)
     const uintptr_t targetOffset = 0xF14DB90;
     uintptr_t targetAddr = g_libBase + targetOffset;
     
-    LOGI_FMT("Target Func: 0x%lx (Base + 0x%lx)", targetAddr, targetOffset);
+    LOGI_FMT("Target Func: 0x%lx", targetAddr);
 
-    if (GlossHook((void*)targetAddr, (void*)hook_queryHandler, (void**)&g_origQueryFunc)) {
-        LOGI("SUCCESS: Molang Query Hooked!");
+    // 关键：这里我们不保存原函数指针了，因为我们不打算调用它
+    // 直接替换成我们的安全函数
+    if (GlossHook((void*)targetAddr, (void*)hook_queryHandler, nullptr)) {
+        LOGI("SUCCESS: Hook installed (Safe Mode - No orig call)");
         g_hookInstalled = true;
     } else {
-        LOGE("FAILED: Could not hook Molang Query");
+        LOGE("FAILED: Could not hook");
     }
 
     LOGI("========== Setup Complete ==========");
@@ -290,6 +281,10 @@ static void* MainThread(void*) {
 
 __attribute__((constructor))
 void init() {
+    // 初始化静态返回值
+    g_staticReturn.f_val = 1.0f;
+    g_staticReturn.d_val = 1.0;
+
     pthread_t t;
     pthread_create(&t, nullptr, MainThread, nullptr);
 }
