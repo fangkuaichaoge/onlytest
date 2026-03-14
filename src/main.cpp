@@ -1,4 +1,4 @@
-// ===================== System Header Files =====================
+// ===================== Includes =====================
 #include <jni.h>
 #include <android/input.h>
 #include <android/log.h>
@@ -19,11 +19,8 @@
 #include <sys/mman.h>
 #include <fstream>
 #include <algorithm>
-#include <sstream>
-#include <iomanip>
 #include <atomic>
 
-// ===================== Project Header Files =====================
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
 #include "ImGui/imgui.h"
@@ -31,345 +28,277 @@
 #include "ImGui/backends/imgui_impl_android.h"
 
 #define LOG_TAG "TimeMod"
-#define LOG_FILE_PATH "/storage/emulated/0/TimeMod_Debug.log"
+#define LOG_FILE "/storage/emulated/0/TimeMod_Debug.log"
 
-// ===================== 全局日志锁 =====================
+// ===================== Globals =====================
 static std::mutex g_logMutex;
-static std::atomic<bool> g_isRunning(false);
-static std::thread* g_pollingThread = nullptr;
+static std::atomic<bool> g_gotData(false);
+static std::thread* g_workerThread = nullptr;
 
-// ===================== 日志函数 =====================
-static void LogDebug(const std::string& level, const std::string& msg) {
-    std::lock_guard<std::mutex> lock(g_logMutex);
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%s] %s", level.c_str(), msg.c_str());
-    std::ofstream logFile(LOG_FILE_PATH, std::ios::app);
-    if (logFile.is_open()) {
-        auto now = std::chrono::system_clock::now();
-        auto time_t_now = std::chrono::system_clock::to_time_t(now);
-        logFile << "[" << std::put_time(std::localtime(&time_t_now), "%H:%M:%S") << "] [" << level << "] " << msg << std::endl;
-        logFile.close();
-    }
-}
+// 核心数据
+typedef long long (*TimeFunc)(void*);
+static TimeFunc g_originalTimeFunc = nullptr; // 真实的函数地址
+static void* g_worldPtr = nullptr;             // 真实的对象指针
 
-#define LOGI_F(...) { \
-    char buf[1024]; \
-    snprintf(buf, sizeof(buf), __VA_ARGS__); \
-    LogDebug("INFO", buf); \
-}
-
-#define LOGE_F(...) { \
-    char buf[1024]; \
-    snprintf(buf, sizeof(buf), __VA_ARGS__); \
-    LogDebug("ERROR", buf); \
-}
-
-// ===================== 时间常量 =====================
-const long long TICKS_PER_DAY = 24000;
-
-// ===================== Time State =====================
-struct TimeState {
-    bool funcFound = false;
-    long long absoluteTime = 0;
+// 显示数据
+struct TimeData {
+    long long ticks = 0;
     int day = 0;
+    bool valid = false;
 };
-static TimeState g_timeState;
-static std::mutex g_timeMutex;
+static TimeData g_displayData;
+static std::mutex g_dataMutex;
 
-// ===================== Hook Function Pointers =====================
-static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
-static void (*orig_Input1)(void*, void*, void*) = nullptr;
-static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+// ===================== Logging =====================
+static void Log(const std::string& lvl, const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%s] %s", lvl.c_str(), msg.c_str());
+    std::ofstream f(LOG_FILE, std::ios::app);
+    if (f.is_open()) {
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        f << "[" << std::put_time(std::localtime(&t), "%H:%M:%S") << "] [" << lvl << "] " << msg << std::endl;
+        f.close();
+    }
+}
+#define LOGI(x) do { char b[512]; snprintf(b, 512, x); Log("INFO", b); } while(0)
+#define LOGI_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("INFO", b); } while(0)
+#define LOGE(x) do { char b[512]; snprintf(b, 512, x); Log("ERROR", b); } while(0)
 
-// ===================== ScriptWorld 时间函数指针 =====================
-typedef long long (*ScriptGetTimeOfDayFunc)(void*);
-static ScriptGetTimeOfDayFunc orig_scriptGetTimeOfDay = nullptr;
-static void* g_scriptWorld = nullptr;
-static std::mutex g_scriptWorldMutex;
+// ===================== Worker Thread (主动调用) =====================
+static void WorkerLoop() {
+    LOGI("Worker Thread started. Actively polling time...");
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 20 FPS 更新率
 
-// ===================== 主动轮询线程 =====================
-static void PollingThreadLoop() {
-    LOGI_F("Polling Thread started.");
-    while (g_isRunning) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 每秒刷新10次
-
-        void* currentWorldPtr = nullptr;
-        ScriptGetTimeOfDayFunc currentFunc = nullptr;
-        
-        {
-            std::lock_guard<std::mutex> lock(g_scriptWorldMutex);
-            currentWorldPtr = g_scriptWorld;
-            currentFunc = orig_scriptGetTimeOfDay;
-        }
-
-        if (currentFunc && currentWorldPtr) {
-            // 主动调用原函数获取时间！
-            long long time = currentFunc(currentWorldPtr);
+        if (g_originalTimeFunc && g_worldPtr) {
+            // 直接调用游戏函数！
+            long long t = g_originalTimeFunc(g_worldPtr);
             
-            std::lock_guard<std::mutex> lock2(g_timeMutex);
-            g_timeState.absoluteTime = time;
-            g_timeState.day = time / TICKS_PER_DAY + 1;
-            g_timeState.funcFound = true;
+            std::lock_guard<std::mutex> lock(g_dataMutex);
+            g_displayData.ticks = t;
+            g_displayData.day = t / 24000 + 1;
+            g_displayData.valid = true;
+            
+            if (!g_gotData) {
+                g_gotData = true;
+                LOGI_FMT("SUCCESS: Data flowing! First tick: %lld", t);
+            }
         }
     }
-    LOGI_F("Polling Thread stopped.");
 }
 
-// ===================== Time Hook (现在只负责捕获 thisPtr) =====================
-static long long hook_scriptGetTimeOfDay(void* thisPtr) {
-    LOGI_F("hook_scriptGetTimeOfDay CALLED! thisPtr: %p", thisPtr);
-    
-    // 保存对象指针，供轮询线程使用
-    {
-        std::lock_guard<std::mutex> lock(g_scriptWorldMutex);
-        g_scriptWorld = thisPtr;
-    }
-
-    // 启动轮询线程（如果还没启动）
-    if (!g_isRunning) {
-        g_isRunning = true;
-        g_pollingThread = new std::thread(PollingThreadLoop);
-    }
-
-    if (!orig_scriptGetTimeOfDay) return 0;
-    return orig_scriptGetTimeOfDay(thisPtr);
-}
-
-// ===================== ImGui Render Global State =====================
-static bool g_Initialized = false;
-static int g_Width = 0, g_Height = 0;
-static EGLContext g_TargetContext = EGL_NO_CONTEXT;
-static EGLSurface g_TargetSurface = EGL_NO_SURFACE;
-static ImFont* g_UIFont = nullptr;
-
-// ===================== Theme Style =====================
-static float g_FontScale = 1.0f;
-
-static void SetupStyle() {
-    ImGuiStyle& s = ImGui::GetStyle();
-    ImVec4* c = s.Colors;
-    const ImVec4 purplePrimary(0.6f, 0.4f, 0.85f, 1.0f);
-    const ImVec4 purpleDark(0.45f, 0.3f, 0.7f, 1.0f);
-    const ImVec4 purpleLight(0.75f, 0.55f, 0.95f, 1.0f);
-    const ImVec4 bgBase(0.94f, 0.90f, 0.98f, 0.96f);
-    const ImVec4 bgSecondary(0.97f, 0.94f, 1.0f, 1.0f);
-    const ImVec4 textMain(0.28f, 0.22f, 0.38f, 1.0f);
-
-    c[ImGuiCol_WindowBg] = bgBase;
-    c[ImGuiCol_ChildBg] = bgSecondary;
-    c[ImGuiCol_FrameBg] = bgSecondary;
-    c[ImGuiCol_TitleBgActive] = purpleLight;
-    c[ImGuiCol_Button] = purplePrimary;
-    c[ImGuiCol_ButtonHovered] = purpleLight;
-    c[ImGuiCol_Text] = textMain;
-
-    float roundScale = g_FontScale;
-    s.WindowRounding = 10.0f * roundScale;
-    s.FrameRounding = 6.0f * roundScale;
-    s.WindowPadding = ImVec2(14.0f * roundScale, 12.0f * roundScale);
-}
-
-// ===================== UI Interface: Time HUD =====================
-static void DrawTimeHUD() {
-    if (g_UIFont) ImGui::PushFont(g_UIFont);
-
-    TimeState state;
-    {
-        std::lock_guard<std::mutex> lock(g_timeMutex);
-        state = g_timeState;
-    }
-
-    ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Always);
-    ImGui::Begin("Game Time", nullptr,
-        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar);
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.4f, 0.85f, 1.0f));
-    ImGui::Text("Game Time");
-    ImGui::PopStyleColor();
-    ImGui::Separator();
-    ImGui::Dummy(ImVec2(0, 8));
-
-    if (state.funcFound) {
-        ImGui::TextColored(ImVec4(0.75f, 0.55f, 0.95f, 1.0f), "Ticks: %lld", state.absoluteTime);
-        int displayDay = state.day;
-        int timeOfDay = state.absoluteTime % TICKS_PER_DAY;
-        int hours = timeOfDay / 1000;
-        int minutes = (timeOfDay % 1000) * 60 / 1000;
+// ===================== Hook Callback (被动捕获) =====================
+static long long hook_getTime(void* thisPtr) {
+    // 只要进了这里，我们就成功了一半！
+    if (g_worldPtr == nullptr) {
+        LOGI_FMT("Hook triggered! Captured thisPtr: %p", thisPtr);
+        g_worldPtr = thisPtr;
         
-        ImGui::Text("Day: %d", displayDay);
-        ImGui::Text("Time: %02d:%02d", hours, minutes);
-    } else {
-        ImGui::TextColored(ImVec4(0.55f, 0.48f, 0.62f, 1.0f), "Waiting for Hook...");
+        // 启动工作线程
+        if (g_workerThread == nullptr) {
+            g_workerThread = new std::thread(WorkerLoop);
+        }
+    }
+
+    // 调用原函数
+    if (g_originalTimeFunc) {
+        return g_originalTimeFunc(thisPtr);
+    }
+    return 0;
+}
+
+// ===================== ImGui & Render =====================
+static bool g_init = false;
+static int g_w = 0, g_h = 0;
+static EGLContext g_ctx = EGL_NO_CONTEXT;
+static EGLSurface g_surf = EGL_NO_SURFACE;
+static ImFont* g_font = nullptr;
+
+static void DrawUI() {
+    if (g_font) ImGui::PushFont(g_font);
+
+    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
+    ImGui::Begin("Time", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize);
+    
+    ImGui::Text("Game Time");
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 4));
+
+    {
+        std::lock_guard<std::mutex> lock(g_dataMutex);
+        if (g_displayData.valid) {
+            ImGui::Text("Day: %d", g_displayData.day);
+            int tod = g_displayData.ticks % 24000;
+            int h = tod / 1000;
+            int m = (tod % 1000) * 60 / 1000;
+            ImGui::Text("Time: %02d:%02d", h, m);
+            ImGui::Text("Ticks: %lld", g_displayData.ticks);
+        } else {
+            ImGui::Text("Waiting for data...");
+            if (g_originalTimeFunc) ImGui::Text("Func: OK");
+            if (g_worldPtr) ImGui::Text("Ptr: OK");
+        }
     }
 
     ImGui::End();
-    if (g_UIFont) ImGui::PopFont();
+    if (g_font) ImGui::PopFont();
 }
 
-// ===================== GL State Protection =====================
-struct GLState {
-    GLint prog, tex, aBuf, eBuf, vao, fbo, vp[4];
-};
+struct GLState { GLint p, t, a, e, v, f, vp[4]; };
 static void SaveGL(GLState& s) {
-    glGetIntegerv(GL_CURRENT_PROGRAM, &s.prog);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.aBuf);
-    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.eBuf);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &s.p);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.t);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.a);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.e);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.v);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.f);
     glGetIntegerv(GL_VIEWPORT, s.vp);
 }
 static void RestoreGL(const GLState& s) {
-    glUseProgram(s.prog);
-    glBindTexture(GL_TEXTURE_2D, s.tex);
-    glBindBuffer(GL_ARRAY_BUFFER, s.aBuf);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.eBuf);
-    glBindVertexArray(s.vao);
-    glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
+    glUseProgram(s.p);
+    glBindTexture(GL_TEXTURE_2D, s.t);
+    glBindBuffer(GL_ARRAY_BUFFER, s.a);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.e);
+    glBindVertexArray(s.v);
+    glBindFramebuffer(GL_FRAMEBUFFER, s.f);
     glViewport(s.vp[0], s.vp[1], s.vp[2], s.vp[3]);
 }
 
-// ===================== ImGui Initialization =====================
-static void Setup() {
-    if (g_Initialized || g_Width <= 0 || g_Height <= 0) return;
+static void SetupImGui() {
+    if (g_init || g_w <=0 || g_h <=0) return;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-
-    float baseScale = (float)g_Height / 720.0f;
-    g_FontScale = std::clamp(baseScale, 1.0f, 2.0f);
-
+    
+    float scale = std::clamp((float)g_h / 720.0f, 1.0f, 2.0f);
     ImFontConfig cfg;
-    cfg.SizePixels = 20.0f * g_FontScale;
-    g_UIFont = io.Fonts->AddFontDefault(&cfg);
+    cfg.SizePixels = 20.0f * scale;
+    g_font = io.Fonts->AddFontDefault(&cfg);
 
     ImGui_ImplAndroid_Init(nullptr);
     ImGui_ImplOpenGL3_Init("#version 300 es");
-    SetupStyle();
-    g_Initialized = true;
+    
+    // Simple style
+    ImGui::GetStyle().WindowRounding = 8.0f;
+    ImGui::GetStyle().Colors[ImGuiCol_WindowBg] = ImVec4(0.94f, 0.90f, 0.98f, 0.96f);
+    ImGui::GetStyle().Colors[ImGuiCol_Text] = ImVec4(0.28f, 0.22f, 0.38f, 1.0f);
+    
+    g_init = true;
 }
 
-static void Render() {
-    if (!g_Initialized) return;
-    GLState s; SaveGL(s);
-
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)g_Width, (float)g_Height);
-    io.DisplayFramebufferScale = ImVec2(1, 1);
-
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_Width, g_Height);
-    ImGui::NewFrame();
-    DrawTimeHUD();
-    ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-    RestoreGL(s);
-}
-
-// ===================== EGL Render Hook =====================
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay d, EGLSurface s) {
-    if (!orig_eglSwapBuffers) return orig_eglSwapBuffers(d, s);
+// ===================== EGL Hook (渲染循环) =====================
+static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface) = nullptr;
+static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
+    if (!orig_swap) return orig_swap(d, s);
+    
     EGLContext ctx = eglGetCurrentContext();
-    if (ctx == EGL_NO_CONTEXT) return orig_eglSwapBuffers(d, s);
+    if (ctx == EGL_NO_CONTEXT) return orig_swap(d, s);
 
-    EGLint w = 0, h = 0;
+    EGLint w=0, h=0;
     eglQuerySurface(d, s, EGL_WIDTH, &w);
     eglQuerySurface(d, s, EGL_HEIGHT, &h);
-    if (w < 500 || h < 500) return orig_eglSwapBuffers(d, s);
+    if (w < 500 || h < 500) return orig_swap(d, s);
 
-    if (g_TargetContext == EGL_NO_CONTEXT) {
-        g_TargetContext = ctx;
-        g_TargetSurface = s;
+    if (g_ctx == EGL_NO_CONTEXT) { g_ctx = ctx; g_surf = s; }
+    if (ctx != g_ctx || s != g_surf) return orig_swap(d, s);
+
+    g_w = w; g_h = h;
+    SetupImGui();
+
+    if (g_init) {
+        GLState gls; SaveGL(gls);
+        ImGuiIO& io = ImGui::GetIO();
+        io.DisplaySize = ImVec2((float)w, (float)h);
+        io.DisplayFramebufferScale = ImVec2(1,1);
+        
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplAndroid_NewFrame(w, h);
+        ImGui::NewFrame();
+        DrawUI();
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        RestoreGL(gls);
     }
-    if (ctx != g_TargetContext || s != g_TargetSurface)
-        return orig_eglSwapBuffers(d, s);
 
-    g_Width = w; g_Height = h;
-    Setup();
-    Render();
-    return orig_eglSwapBuffers(d, s);
+    return orig_swap(d, s);
 }
 
-// ===================== Input Hook =====================
-static void hook_Input1(void* thiz, void* a1, void* a2) {
-    if (orig_Input1) orig_Input1(thiz, a1, a2);
-    if (thiz && g_Initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
-}
-static int32_t hook_Input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** e) {
-    int32_t r = orig_Input2 ? orig_Input2(thiz, a1, a2, a3, a4, e) : 0;
-    if (r == 0 && e && *e && g_Initialized)
-        ImGui_ImplAndroid_HandleInputEvent(*e);
-    return r;
-}
-static void HookInput() {
+// ===================== Input Hooks =====================
+static void (*orig_in1)(void*, void*, void*) = nullptr;
+static int32_t (*orig_in2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+
+static void hook_in1(void* thiz, void* a1, void* a2) { if(orig_in1) orig_in1(thiz,a1,a2); if(thiz&&g_init) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz); }
+static int32_t hook_in2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** e) { int r=orig_in2?orig_in2(thiz,a1,a2,a3,a4,e):0; if(r==0&&e&&*e&&g_init) ImGui_ImplAndroid_HandleInputEvent(*e); return r; }
+
+// ===================== Main Init =====================
+static void* MainThread(void*) {
+    sleep(3);
+    LOGI("Initializing...");
+    GlossInit(true);
+
+    // Hook EGL
+    GHandle egl = GlossOpen("libEGL.so");
+    void* swap = (void*)GlossSymbol(egl, "eglSwapBuffers", nullptr);
+    if (swap) GlossHook(swap, (void*)hook_swap, (void**)&orig_swap);
+
+    // Hook Input
     void* s1 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
-    if (s1) GlossHook(s1, (void*)hook_Input1, (void**)&orig_Input1);
+    if (s1) GlossHook(s1, (void*)hook_in1, (void**)&orig_in1);
     void* s2 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_10InputEventEblPjPSA_", nullptr);
-    if (s2) GlossHook(s2, (void*)hook_Input2, (void**)&orig_Input2);
-}
+    if (s2) GlossHook(s2, (void*)hook_in2, (void**)&orig_in2);
 
-// ===================== 核心逻辑：双路尝试 Hook =====================
-static bool findAndHookTime() {
-    LOGI_F("Entering findAndHookTime...");
-    std::ofstream logFile(LOG_FILE_PATH, std::ios::trunc);
-    if (logFile.is_open()) logFile.close();
-
+    // ==========================================
+    // 核心逻辑：Hook 目标函数
+    // ==========================================
+    LOGI("Finding target function...");
+    
+    // 1. 找基址
     void* mcLib = dlopen("libminecraftpe.so", RTLD_NOLOAD);
     if (!mcLib) mcLib = dlopen("libminecraftpe.so", RTLD_LAZY);
-    if (!mcLib) { LOGE_F("Failed to open libminecraftpe.so"); return false; }
-    
-    uintptr_t libBase = 0;
+    if (!mcLib) { LOGE("libminecraftpe.so not found"); return nullptr; }
+
+    uintptr_t base = 0;
     std::ifstream maps("/proc/self/maps");
     std::string line;
     while (std::getline(maps, line)) {
         if (line.find("libminecraftpe.so") != std::string::npos && line.find("r-xp") != std::string::npos) {
-            uintptr_t start, end;
-            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                if (libBase == 0) { libBase = start; LOGI_F("Found base: 0x%lx", libBase); }
+            uintptr_t s, e;
+            if (sscanf(line.c_str(), "%lx-%lx", &s, &e) == 2) {
+                if (base == 0) base = s;
             }
         }
     }
-    if (libBase == 0) return false;
+    if (base == 0) { LOGE("Base not found"); return nullptr; }
 
-    bool hooked = false;
-    const uintptr_t reflectionOffset = 0x2ad4af1; // 保持你原来的偏移
+    // 2. 计算地址
+    const uintptr_t offset = 0x2ad4af1; // 你提供的最新地址
+    uintptr_t absAddr = base + offset;
+    LOGI_FMT("Base: 0x%lx | Offset: 0x%lx | Abs: 0x%lx", base, offset, absAddr);
 
-    LOGI_F("--- Attempting Hook by Address ---");
-    void* funcAddr = (void*)(libBase + reflectionOffset);
-    LOGI_F("Target Address: 0x%lx", (uintptr_t)funcAddr);
+    // 3. 保存原函数指针（以便我们自己主动调用）
+    g_originalTimeFunc = (TimeFunc)absAddr;
 
-    orig_scriptGetTimeOfDay = (ScriptGetTimeOfDayFunc)funcAddr;
-    if (GlossHook(funcAddr, (void*)hook_scriptGetTimeOfDay, (void**)&orig_scriptGetTimeOfDay)) {
-        LOGI_F("SUCCESS: Hook installed. Now enter the game!");
-        hooked = true;
+    // 4. 安装 Hook（以便我们捕获 thisPtr）
+    LOGI("Installing hook...");
+    if (GlossHook((void*)absAddr, (void*)hook_getTime, (void**)&g_originalTimeFunc)) {
+        LOGI("Hook installed successfully!");
     } else {
-        LOGE_F("Hook failed.");
+        // 如果 GlossHook 失败，尝试只保存不 hook（虽然没 thisPtr 不行，但至少日志有记录）
+        LOGI("Hook install failed, but func ptr saved.");
+        g_originalTimeFunc = (TimeFunc)absAddr; 
     }
 
-    return hooked;
-}
-
-// ===================== Main Thread =====================
-static void* MainThread(void*) {
-    LOGI_F("MainThread started.");
-    sleep(3);
-    GlossInit(true);
-    
-    GHandle egl = GlossOpen("libEGL.so");
-    void* swap = (void*)GlossSymbol(egl, "eglSwapBuffers", nullptr);
-    if (swap) GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-    
-    HookInput();
-    findAndHookTime();
-    
-    LOGI_F("Setup complete.");
+    LOGI("Init complete. Enter the game!");
     return nullptr;
 }
 
 __attribute__((constructor))
 void init() {
-    std::ofstream logFile(LOG_FILE_PATH, std::ios::trunc);
-    if (logFile.is_open()) { logFile << "Module loaded." << std::endl; logFile.close(); }
+    // 清空旧日志
+    std::ofstream f(LOG_FILE, std::ios::trunc);
+    if (f.is_open()) { f << "Module loaded." << std::endl; f.close(); }
+    
     pthread_t t;
     pthread_create(&t, nullptr, MainThread, nullptr);
 }
