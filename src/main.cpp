@@ -52,9 +52,12 @@ static void Log(const std::string& lvl, const std::string& msg) {
         f.close();
     }
 }
+
+// 修复：确保所有宏都已定义
 #define LOGI(x) do { char b[512]; snprintf(b, 512, x); Log("INFO", b); } while(0)
-#define LOGI_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("INFO", b); } while(0)
 #define LOGE(x) do { char b[512]; snprintf(b, 512, x); Log("ERROR", b); } while(0)
+#define LOGI_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("INFO", b); } while(0)
+#define LOGE_FMT(...) do { char b[512]; snprintf(b, 512, __VA_ARGS__); Log("ERROR", b); } while(0)
 
 // 通用触发记录函数
 static void MarkTriggered(const std::string& name) {
